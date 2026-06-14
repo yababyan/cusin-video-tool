@@ -30,6 +30,7 @@ APP_TITLE = "CUSINI ROYAL VIDEO TOOL"
 HEADER_IMAGE_FILE = "images.jpg"
 WINDOW_ICON_FILE = "DotA2MinimapIcons_AgADagwAAsd2IVA.png"
 EXE_ICON_FILE = "cusini_royal_video_tool.ico"
+DEFAULT_TRIM_DURATION = 60.0
 
 
 VIDEO_EXTENSIONS = {
@@ -248,6 +249,60 @@ def get_ffmpeg_executable() -> str:
         ) from exc
 
     return get_ffmpeg_exe()
+
+
+def get_ffprobe_executable() -> str | None:
+    system_ffprobe = shutil.which("ffprobe")
+    if system_ffprobe:
+        return system_ffprobe
+
+    try:
+        ffmpeg_path = Path(get_ffmpeg_executable())
+    except RuntimeError:
+        return None
+
+    candidate_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    candidate = ffmpeg_path.with_name(candidate_name)
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+def probe_video_duration(input_path: Path) -> float | None:
+    ffprobe = get_ffprobe_executable()
+    if ffprobe is None:
+        return None
+
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(input_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        return None
+
+    if duration <= 0:
+        return None
+    return duration
 
 
 def build_compress_command(
@@ -741,6 +796,8 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             self.is_busy = False
             self.header_photo: object | None = None
             self.window_icon_photo: object | None = None
+            self.trim_duration = DEFAULT_TRIM_DURATION
+            self._syncing_trim_controls = False
 
             self.input_path_var = tk.StringVar()
             self.input_info_var = tk.StringVar(value="Файл не выбран.")
@@ -750,6 +807,11 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             self.profile_description_var = tk.StringVar()
             self.trim_start_var = tk.StringVar(value="0")
             self.trim_end_var = tk.StringVar(value="10")
+            self.trim_start_scale_var = tk.DoubleVar(value=0)
+            self.trim_end_scale_var = tk.DoubleVar(value=10)
+            self.trim_duration_var = tk.StringVar(
+                value=f"Диапазон ползунков: 0-{format_seconds(DEFAULT_TRIM_DURATION)} сек"
+            )
 
             self.interactive_widgets: list[object] = []
 
@@ -770,6 +832,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             style.configure("Hint.TLabel", foreground="#505050")
             style.configure("Section.TLabelframe", padding=12)
             style.configure("ProfileTitle.TLabel", font=("Segoe UI", 11, "bold"))
+            style.configure("Value.TLabel", font=("Segoe UI", 10, "bold"))
 
         def _load_assets(self) -> None:
             self.window_icon_photo = self._load_photo(WINDOW_ICON_FILE, (96, 96))
@@ -950,21 +1013,55 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
         def _build_trim_tab(self) -> None:
             self.trim_tab.columnconfigure(1, weight=1)
 
-            ttk.Label(self.trim_tab, text="Начало, сек:").grid(row=0, column=0, sticky="w", pady=4)
-            start_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_start_var, width=14)
-            start_entry.grid(row=0, column=1, sticky="w", pady=4)
+            ttk.Label(self.trim_tab, text="Начало:").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            start_scale = ttk.Scale(
+                self.trim_tab,
+                from_=0,
+                to=self.trim_duration,
+                variable=self.trim_start_scale_var,
+                command=self._on_trim_start_scale,
+            )
+            start_scale.grid(row=0, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
+            self.trim_start_scale = start_scale
+            self.interactive_widgets.append(start_scale)
+
+            start_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_start_var, width=10)
+            start_entry.grid(row=0, column=2, sticky="e", pady=(0, 8))
+            start_entry.bind("<FocusOut>", self._on_trim_entry_changed)
+            start_entry.bind("<Return>", self._on_trim_entry_changed)
             self.interactive_widgets.append(start_entry)
 
-            ttk.Label(self.trim_tab, text="Конец, сек:").grid(row=1, column=0, sticky="w", pady=4)
-            end_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_end_var, width=14)
-            end_entry.grid(row=1, column=1, sticky="w", pady=4)
+            ttk.Label(self.trim_tab, text="Конец:").grid(row=1, column=0, sticky="w", pady=(0, 8))
+            end_scale = ttk.Scale(
+                self.trim_tab,
+                from_=0,
+                to=self.trim_duration,
+                variable=self.trim_end_scale_var,
+                command=self._on_trim_end_scale,
+            )
+            end_scale.grid(row=1, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
+            self.trim_end_scale = end_scale
+            self.interactive_widgets.append(end_scale)
+
+            end_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_end_var, width=10)
+            end_entry.grid(row=1, column=2, sticky="e", pady=(0, 8))
+            end_entry.bind("<FocusOut>", self._on_trim_entry_changed)
+            end_entry.bind("<Return>", self._on_trim_entry_changed)
             self.interactive_widgets.append(end_entry)
 
             ttk.Label(
                 self.trim_tab,
-                text="Поддерживаются целые и дробные значения, например 12 или 12.5.",
+                textvariable=self.trim_duration_var,
+                style="Value.TLabel",
+            ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+            ttk.Label(
+                self.trim_tab,
+                text="Двигайте ползунки для быстрой обрезки. Поля справа можно использовать для точного значения в секундах.",
                 style="Hint.TLabel",
-            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                wraplength=760,
+                justify="left",
+            ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         def _on_profile_changed(self, _event: object | None = None) -> None:
             self._refresh_profile_state()
@@ -973,6 +1070,65 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             selected_title = self.profile_var.get()
             profile = COMPRESSION_PROFILE_BY_TITLE[selected_title]
             self.profile_description_var.set(profile.description)
+
+        def _set_trim_duration(self, duration: float | None) -> None:
+            self.trim_duration = max(duration or DEFAULT_TRIM_DURATION, 1.0)
+            self.trim_start_scale.configure(to=self.trim_duration)
+            self.trim_end_scale.configure(to=self.trim_duration)
+
+            start = min(self.trim_start_scale_var.get(), self.trim_duration)
+            end = min(max(self.trim_end_scale_var.get(), start + 1), self.trim_duration)
+            if end <= start:
+                start = 0
+                end = min(10.0, self.trim_duration)
+
+            self.trim_duration_var.set(
+                f"Диапазон ползунков: 0-{format_seconds(self.trim_duration)} сек"
+            )
+            self._set_trim_values(start, end)
+
+        def _set_trim_values(self, start: float, end: float) -> None:
+            start = max(0.0, min(start, self.trim_duration))
+            end = max(0.0, min(end, self.trim_duration))
+            if end <= start:
+                end = min(self.trim_duration, start + 0.1)
+            if end <= start:
+                start = max(0.0, end - 0.1)
+
+            self._syncing_trim_controls = True
+            self.trim_start_scale_var.set(start)
+            self.trim_end_scale_var.set(end)
+            self.trim_start_var.set(format_seconds(start))
+            self.trim_end_var.set(format_seconds(end))
+            self._syncing_trim_controls = False
+
+        def _on_trim_start_scale(self, raw_value: str) -> None:
+            if self._syncing_trim_controls:
+                return
+            start = round(float(raw_value), 1)
+            end = self.trim_end_scale_var.get()
+            if start >= end:
+                end = min(self.trim_duration, start + 0.1)
+            self._set_trim_values(start, end)
+
+        def _on_trim_end_scale(self, raw_value: str) -> None:
+            if self._syncing_trim_controls:
+                return
+            end = round(float(raw_value), 1)
+            start = self.trim_start_scale_var.get()
+            if end <= start:
+                start = max(0.0, end - 0.1)
+            self._set_trim_values(start, end)
+
+        def _on_trim_entry_changed(self, _event: object | None = None) -> None:
+            if self._syncing_trim_controls:
+                return
+            try:
+                start = self._parse_non_negative_float(self.trim_start_var.get(), "Начало")
+                end = self._parse_non_negative_float(self.trim_end_var.get(), "Конец")
+            except ValueError:
+                return
+            self._set_trim_values(start, end)
 
         def _on_tab_changed(self, _event: object | None = None) -> None:
             self._update_run_button_text()
@@ -1002,10 +1158,17 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 return
 
             self.selected_input = ensure_input_exists(Path(file_path))
+            duration = probe_video_duration(self.selected_input)
             self.input_path_var.set(str(self.selected_input))
-            self.input_info_var.set(
-                f"{self.selected_input.name} | {format_size(self.selected_input.stat().st_size)}"
+            duration_text = (
+                f" | длительность: {format_seconds(duration)} сек"
+                if duration is not None
+                else ""
             )
+            self.input_info_var.set(
+                f"{self.selected_input.name} | {format_size(self.selected_input.stat().st_size)}{duration_text}"
+            )
+            self._set_trim_duration(duration)
             self.last_output_path = None
             self.open_folder_button.configure(state="disabled")
             self._update_auto_output_path(force=True)
@@ -1084,6 +1247,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             if self.selected_input is None:
                 raise ValueError("Сначала выберите видеофайл.")
 
+            self._on_trim_entry_changed()
             start = self._parse_non_negative_float(self.trim_start_var.get(), "Начало")
             end = self._parse_non_negative_float(self.trim_end_var.get(), "Конец")
 
