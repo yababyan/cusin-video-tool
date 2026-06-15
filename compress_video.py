@@ -823,16 +823,49 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
 
         def _configure_style(self) -> None:
             style = ttk.Style()
-            for theme_name in ("vista", "xpnative", "clam"):
-                if theme_name in style.theme_names():
-                    style.theme_use(theme_name)
-                    break
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
 
-            style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
-            style.configure("Hint.TLabel", foreground="#505050")
-            style.configure("Section.TLabelframe", padding=12)
-            style.configure("ProfileTitle.TLabel", font=("Segoe UI", 11, "bold"))
-            style.configure("Value.TLabel", font=("Segoe UI", 10, "bold"))
+            self.colors = {
+                "bg": "#f5f7fb",
+                "panel": "#ffffff",
+                "panel_alt": "#eef3f8",
+                "border": "#d8e0ea",
+                "text": "#172033",
+                "muted": "#657086",
+                "accent": "#2563eb",
+                "accent_active": "#1d4ed8",
+                "accent_soft": "#dbeafe",
+                "success": "#15803d",
+                "log": "#111827",
+            }
+
+            self.root.configure(bg=self.colors["bg"])
+            style.configure(".", font=("Segoe UI", 10), background=self.colors["bg"])
+            style.configure("App.TFrame", background=self.colors["bg"])
+            style.configure("Card.TFrame", background=self.colors["panel"], relief="flat")
+            style.configure("Hero.TFrame", background=self.colors["panel_alt"])
+            style.configure("TLabel", foreground=self.colors["text"], background=self.colors["panel"])
+            style.configure("Title.TLabel", font=("Segoe UI", 22, "bold"), foreground=self.colors["text"], background=self.colors["panel_alt"])
+            style.configure("HeroHint.TLabel", foreground=self.colors["muted"], background=self.colors["panel_alt"])
+            style.configure("SectionTitle.TLabel", font=("Segoe UI", 12, "bold"), foreground=self.colors["text"], background=self.colors["panel"])
+            style.configure("Hint.TLabel", foreground=self.colors["muted"], background=self.colors["panel"])
+            style.configure("AppHint.TLabel", foreground=self.colors["muted"], background=self.colors["bg"])
+            style.configure("ProfileTitle.TLabel", font=("Segoe UI", 11, "bold"), foreground=self.colors["text"], background=self.colors["panel"])
+            style.configure("Value.TLabel", font=("Segoe UI", 10, "bold"), foreground=self.colors["accent"], background=self.colors["panel"])
+            style.configure("Photo.TLabel", background=self.colors["panel_alt"])
+            style.configure("TEntry", fieldbackground="#ffffff", bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], padding=7)
+            style.configure("TCombobox", fieldbackground="#ffffff", bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], padding=6)
+            style.configure("TButton", padding=(14, 8), borderwidth=0, focusthickness=0)
+            style.configure("Accent.TButton", foreground="#ffffff", background=self.colors["accent"], padding=(18, 10), font=("Segoe UI", 10, "bold"))
+            style.map("Accent.TButton", background=[("active", self.colors["accent_active"]), ("disabled", "#9ca3af")])
+            style.configure("Ghost.TButton", foreground=self.colors["text"], background=self.colors["accent_soft"], padding=(14, 8))
+            style.map("Ghost.TButton", background=[("active", "#bfdbfe"), ("disabled", "#e5e7eb")])
+            style.configure("TNotebook", background=self.colors["panel"], borderwidth=0)
+            style.configure("TNotebook.Tab", padding=(18, 9), background="#e8edf5", foreground=self.colors["muted"])
+            style.map("TNotebook.Tab", background=[("selected", self.colors["panel"])], foreground=[("selected", self.colors["text"])])
+            style.configure("Horizontal.TProgressbar", troughcolor="#e5e7eb", background=self.colors["accent"], bordercolor="#e5e7eb", lightcolor=self.colors["accent"], darkcolor=self.colors["accent"])
+            style.configure("Horizontal.TScale", background=self.colors["panel"], troughcolor="#dbe4ef")
 
         def _load_assets(self) -> None:
             self.window_icon_photo = self._load_photo(WINDOW_ICON_FILE, (96, 96))
@@ -851,26 +884,26 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             return ImageTk.PhotoImage(resized)
 
         def _build_ui(self) -> None:
-            main = ttk.Frame(self.root, padding=16)
+            main = ttk.Frame(self.root, padding=18, style="App.TFrame")
             main.pack(fill="both", expand=True)
 
-            header = ttk.Frame(main)
-            header.pack(fill="x")
+            header = ttk.Frame(main, padding=18, style="Hero.TFrame")
+            header.pack(fill="x", pady=(0, 14))
             header.columnconfigure(0, weight=1)
 
-            title_block = ttk.Frame(header)
-            title_block.grid(row=0, column=0, sticky="nw", padx=(0, 16))
+            title_block = ttk.Frame(header, style="Hero.TFrame")
+            title_block.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
             ttk.Label(title_block, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
             ttk.Label(
                 title_block,
-                text="Выберите файл через стандартный проводник Windows и запускайте сжатие или обрезку одной кнопкой.",
-                style="Hint.TLabel",
-                wraplength=560,
+                text="Быстрая подготовка роликов: выберите видео, задайте режим и получите аккуратный MP4 рядом с исходником.",
+                style="HeroHint.TLabel",
+                wraplength=620,
                 justify="left",
-            ).pack(anchor="w", pady=(6, 0))
+            ).pack(anchor="w", pady=(8, 0))
 
             if self.header_photo is not None:
-                ttk.Label(header, image=self.header_photo).grid(row=0, column=1, sticky="ne")
+                ttk.Label(header, image=self.header_photo, style="Photo.TLabel").grid(row=0, column=1, sticky="ne")
             else:
                 ttk.Label(
                     header,
@@ -881,15 +914,16 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                     width=18,
                 ).grid(row=0, column=1, sticky="ne")
 
-            file_frame = ttk.LabelFrame(main, text="Исходный файл", style="Section.TLabelframe")
-            file_frame.pack(fill="x", pady=(16, 12))
+            file_frame = ttk.Frame(main, padding=16, style="Card.TFrame")
+            file_frame.pack(fill="x", pady=(0, 12))
             file_frame.columnconfigure(0, weight=1)
+            ttk.Label(file_frame, text="Исходный файл", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
             input_entry = ttk.Entry(file_frame, textvariable=self.input_path_var, state="readonly")
-            input_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+            input_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10))
 
-            browse_button = ttk.Button(file_frame, text="Выбрать файл...", command=self.choose_input_file)
-            browse_button.grid(row=0, column=1, sticky="ew")
+            browse_button = ttk.Button(file_frame, text="Выбрать файл", command=self.choose_input_file, style="Ghost.TButton")
+            browse_button.grid(row=1, column=1, sticky="ew")
             self.interactive_widgets.append(browse_button)
 
             ttk.Label(
@@ -898,46 +932,47 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 style="Hint.TLabel",
                 wraplength=860,
                 justify="left",
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(9, 0))
 
             self.notebook = ttk.Notebook(main)
-            self.notebook.pack(fill="x")
+            self.notebook.pack(fill="x", pady=(0, 12))
             self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-            self.compress_tab = ttk.Frame(self.notebook, padding=12)
-            self.trim_tab = ttk.Frame(self.notebook, padding=12)
+            self.compress_tab = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
+            self.trim_tab = ttk.Frame(self.notebook, padding=16, style="Card.TFrame")
             self.notebook.add(self.compress_tab, text="Сжатие")
             self.notebook.add(self.trim_tab, text="Обрезка")
 
             self._build_compress_tab()
             self._build_trim_tab()
 
-            output_frame = ttk.LabelFrame(main, text="Результат", style="Section.TLabelframe")
-            output_frame.pack(fill="x", pady=(12, 12))
+            output_frame = ttk.Frame(main, padding=16, style="Card.TFrame")
+            output_frame.pack(fill="x", pady=(0, 12))
             output_frame.columnconfigure(0, weight=1)
+            ttk.Label(output_frame, text="Результат", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
             output_entry = ttk.Entry(output_frame, textvariable=self.output_path_var)
-            output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+            output_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10))
             self.interactive_widgets.append(output_entry)
 
-            auto_button = ttk.Button(output_frame, text="Авто", command=self.use_auto_output_path)
-            auto_button.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+            auto_button = ttk.Button(output_frame, text="Авто", command=self.use_auto_output_path, style="Ghost.TButton")
+            auto_button.grid(row=1, column=1, sticky="ew", padx=(0, 8))
             self.interactive_widgets.append(auto_button)
 
-            output_button = ttk.Button(output_frame, text="Выбрать...", command=self.choose_output_file)
-            output_button.grid(row=0, column=2, sticky="ew")
+            output_button = ttk.Button(output_frame, text="Выбрать", command=self.choose_output_file, style="Ghost.TButton")
+            output_button.grid(row=1, column=2, sticky="ew")
             self.interactive_widgets.append(output_button)
 
             ttk.Label(
                 output_frame,
                 text="Можно оставить автогенерацию имени файла или выбрать путь вручную.",
                 style="Hint.TLabel",
-            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(9, 0))
 
-            actions = ttk.Frame(main)
+            actions = ttk.Frame(main, style="App.TFrame")
             actions.pack(fill="x", pady=(4, 12))
 
-            self.run_button = ttk.Button(actions, text="Запустить", command=self.start_operation)
+            self.run_button = ttk.Button(actions, text="Запустить", command=self.start_operation, style="Accent.TButton")
             self.run_button.pack(side="left")
             self.interactive_widgets.append(self.run_button)
 
@@ -946,26 +981,28 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 text="Открыть папку результата",
                 command=self.open_output_folder,
                 state="disabled",
+                style="Ghost.TButton",
             )
             self.open_folder_button.pack(side="left", padx=(8, 0))
 
             ttk.Label(
                 actions,
                 textvariable=self.status_var,
-                style="Hint.TLabel",
+                style="AppHint.TLabel",
                 wraplength=520,
                 justify="right",
             ).pack(side="right")
 
-            progress_frame = ttk.Frame(main)
+            progress_frame = ttk.Frame(main, style="App.TFrame")
             progress_frame.pack(fill="x", pady=(0, 12))
             self.progress = ttk.Progressbar(progress_frame, mode="indeterminate")
             self.progress.pack(fill="x")
 
-            log_frame = ttk.LabelFrame(main, text="Журнал", style="Section.TLabelframe")
+            log_frame = ttk.Frame(main, padding=16, style="Card.TFrame")
             log_frame.pack(fill="both", expand=True)
             log_frame.columnconfigure(0, weight=1)
-            log_frame.rowconfigure(0, weight=1)
+            log_frame.rowconfigure(1, weight=1)
+            ttk.Label(log_frame, text="Журнал", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
             self.log_text = tk.Text(
                 log_frame,
@@ -973,24 +1010,31 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 wrap="word",
                 state="disabled",
                 font=("Consolas", 10),
+                bg=self.colors["log"],
+                fg="#e5e7eb",
+                insertbackground="#e5e7eb",
+                relief="flat",
+                padx=12,
+                pady=10,
             )
-            self.log_text.grid(row=0, column=0, sticky="nsew")
+            self.log_text.grid(row=1, column=0, sticky="nsew")
 
             scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-            scrollbar.grid(row=0, column=1, sticky="ns")
+            scrollbar.grid(row=1, column=1, sticky="ns")
             self.log_text.configure(yscrollcommand=scrollbar.set)
 
         def _build_compress_tab(self) -> None:
             self.compress_tab.columnconfigure(1, weight=1)
 
-            ttk.Label(self.compress_tab, text="Пресет:").grid(row=0, column=0, sticky="w")
+            ttk.Label(self.compress_tab, text="Настройки сжатия", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            ttk.Label(self.compress_tab, text="Профиль").grid(row=1, column=0, sticky="w", pady=(0, 8))
             profile_combo = ttk.Combobox(
                 self.compress_tab,
                 textvariable=self.profile_var,
                 values=[profile.title for profile in COMPRESSION_PROFILES],
                 state="readonly",
             )
-            profile_combo.grid(row=0, column=1, sticky="ew")
+            profile_combo.grid(row=1, column=1, sticky="ew", pady=(0, 8))
             profile_combo.bind("<<ComboboxSelected>>", self._on_profile_changed)
             self.interactive_widgets.append(profile_combo)
 
@@ -1000,7 +1044,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 style="ProfileTitle.TLabel",
                 wraplength=760,
                 justify="left",
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 6))
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 6))
 
             ttk.Label(
                 self.compress_tab,
@@ -1008,12 +1052,13 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 style="Hint.TLabel",
                 wraplength=760,
                 justify="left",
-            ).grid(row=2, column=0, columnspan=2, sticky="w")
+            ).grid(row=3, column=0, columnspan=2, sticky="w")
 
         def _build_trim_tab(self) -> None:
             self.trim_tab.columnconfigure(1, weight=1)
 
-            ttk.Label(self.trim_tab, text="Начало:").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            ttk.Label(self.trim_tab, text="Обрезка по таймлайну", style="SectionTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+            ttk.Label(self.trim_tab, text="Начало").grid(row=1, column=0, sticky="w", pady=(0, 8))
             start_scale = ttk.Scale(
                 self.trim_tab,
                 from_=0,
@@ -1021,17 +1066,17 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 variable=self.trim_start_scale_var,
                 command=self._on_trim_start_scale,
             )
-            start_scale.grid(row=0, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
+            start_scale.grid(row=1, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
             self.trim_start_scale = start_scale
             self.interactive_widgets.append(start_scale)
 
             start_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_start_var, width=10)
-            start_entry.grid(row=0, column=2, sticky="e", pady=(0, 8))
+            start_entry.grid(row=1, column=2, sticky="e", pady=(0, 8))
             start_entry.bind("<FocusOut>", self._on_trim_entry_changed)
             start_entry.bind("<Return>", self._on_trim_entry_changed)
             self.interactive_widgets.append(start_entry)
 
-            ttk.Label(self.trim_tab, text="Конец:").grid(row=1, column=0, sticky="w", pady=(0, 8))
+            ttk.Label(self.trim_tab, text="Конец").grid(row=2, column=0, sticky="w", pady=(0, 8))
             end_scale = ttk.Scale(
                 self.trim_tab,
                 from_=0,
@@ -1039,12 +1084,12 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 variable=self.trim_end_scale_var,
                 command=self._on_trim_end_scale,
             )
-            end_scale.grid(row=1, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
+            end_scale.grid(row=2, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
             self.trim_end_scale = end_scale
             self.interactive_widgets.append(end_scale)
 
             end_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_end_var, width=10)
-            end_entry.grid(row=1, column=2, sticky="e", pady=(0, 8))
+            end_entry.grid(row=2, column=2, sticky="e", pady=(0, 8))
             end_entry.bind("<FocusOut>", self._on_trim_entry_changed)
             end_entry.bind("<Return>", self._on_trim_entry_changed)
             self.interactive_widgets.append(end_entry)
@@ -1053,7 +1098,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 self.trim_tab,
                 textvariable=self.trim_duration_var,
                 style="Value.TLabel",
-            ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
             ttk.Label(
                 self.trim_tab,
@@ -1061,7 +1106,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 style="Hint.TLabel",
                 wraplength=760,
                 justify="left",
-            ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         def _on_profile_changed(self, _event: object | None = None) -> None:
             self._refresh_profile_state()
