@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 try:
     import tkinter as tk
@@ -33,11 +36,29 @@ EXE_ICON_FILE = "cusini_royal_video_tool.ico"
 DOTA_LOGO_FILE = "dota2-logo.png"
 RETRO_WATERMARK_FILE = "retro-watermark.png"
 MODE_ICON_FILES = {
-    "compress": "mode-compress.png",
-    "trim": "mode-trim.png",
+    "discord": "mode-compress.png",
     "retro": "mode-retro.png",
+    "gif": "mode-gif.png",
+    "custom": "mode-custom.png",
 }
 DEFAULT_TRIM_DURATION = 60.0
+DEFAULT_SIZE_LIMIT_MB = 15
+SIZE_LIMIT_OPTIONS = ("10 МБ", "15 МБ", "25 МБ", "50 МБ", "500 МБ")
+MAX_TARGET_VIDEO_KBPS = 8000
+RETRO_WIDTH = 640
+RETRO_HEIGHT = 480
+RETRO_FPS = 12
+
+
+def aspect_crop_filter(ratio_w: int, ratio_h: int) -> str:
+    """Центральный кроп под заданное соотношение сторон."""
+    return f"crop=w='min(iw,ih*{ratio_w}/{ratio_h})':h='min(ih,iw*{ratio_h}/{ratio_w})'"
+
+
+RETRO_BASE_FILTER = (
+    f"{aspect_crop_filter(4, 3)},"
+    f"scale={RETRO_WIDTH}:{RETRO_HEIGHT}:flags=neighbor,fps={RETRO_FPS}"
+)
 
 
 VIDEO_EXTENSIONS = {
@@ -119,7 +140,7 @@ COMPRESSION_PROFILES = [
     ),
     CompressionProfile(
         title="Квадрат из 2000-х",
-        description="Квадрат 480x480, 12 FPS, ретро-качество и watermark в стиле Bandicam.",
+        description="Кадр 4:3 640x480, 12 FPS, ретро-качество и watermark в стиле Bandicam.",
         crf=36,
         preset="veryfast",
         width=None,
@@ -172,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
     trim_parser = subparsers.add_parser("trim", help="Обрезать видео по секундам.")
     add_trim_arguments(trim_parser)
 
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Фрагмент + режим за один проход: discord, retro, gif или custom.",
+    )
+    add_export_arguments(export_parser)
+
     return parser
 
 
@@ -222,6 +249,30 @@ def add_trim_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="Путь к результату. По умолчанию: <input>_trimmed.mp4",
     )
+
+
+def add_export_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("input", type=Path, help="Путь к видео или GIF.")
+    parser.add_argument(
+        "--mode",
+        choices=("discord", "retro", "gif", "custom"),
+        default="discord",
+        help="discord — влезть в лимит, retro — шакал 4:3 из 2000-х, gif, custom. По умолчанию: discord",
+    )
+    parser.add_argument("--start", type=non_negative_float, default=0.0, help="Начало, сек.")
+    parser.add_argument("--end", type=non_negative_float, help="Конец, сек. По умолчанию — до конца.")
+    parser.add_argument(
+        "--limit",
+        type=float,
+        default=DEFAULT_SIZE_LIMIT_MB,
+        help=f"Лимит размера в МБ для discord/retro. По умолчанию: {DEFAULT_SIZE_LIMIT_MB}",
+    )
+    parser.add_argument("--gif-width", type=positive_int, default=480, help="Ширина GIF.")
+    parser.add_argument("--gif-fps", type=positive_int, default=15, help="FPS GIF.")
+    parser.add_argument(
+        "--gif-aspect", choices=("1:1", "4:3", "16:9"), help="Кроп GIF под соотношение сторон."
+    )
+    parser.add_argument("-o", "--output", type=Path, help="Путь к результату.")
 
 
 def expected_output_suffix(input_path: Path) -> str:
@@ -283,60 +334,6 @@ def get_ffmpeg_executable() -> str:
     return get_ffmpeg_exe()
 
 
-def get_ffprobe_executable() -> str | None:
-    system_ffprobe = shutil.which("ffprobe")
-    if system_ffprobe:
-        return system_ffprobe
-
-    try:
-        ffmpeg_path = Path(get_ffmpeg_executable())
-    except RuntimeError:
-        return None
-
-    candidate_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-    candidate = ffmpeg_path.with_name(candidate_name)
-    if candidate.exists():
-        return str(candidate)
-    return None
-
-
-def probe_video_duration(input_path: Path) -> float | None:
-    ffprobe = get_ffprobe_executable()
-    if ffprobe is None:
-        return None
-
-    command = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(input_path),
-    ]
-
-    try:
-        result = subprocess.run(
-            command,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-    try:
-        duration = float(result.stdout.strip())
-    except ValueError:
-        return None
-
-    if duration <= 0:
-        return None
-    return duration
-
-
 def build_compress_command(
     args: argparse.Namespace, input_path: Path, output_path: Path
 ) -> list[str]:
@@ -373,8 +370,7 @@ def build_compress_command(
         if is_retro_square:
             command.extend(["-i", str(resource_path(RETRO_WATERMARK_FILE))])
             source_filters = (
-                "crop=min(iw\\,ih):min(iw\\,ih),"
-                "scale=480:480:flags=neighbor,fps=12[base];"
+                f"{RETRO_BASE_FILTER}[base];"
                 "[base][1:v]overlay=(W-w)/2:18:format=auto[prepared]"
             )
             max_colors = 96
@@ -420,8 +416,7 @@ def build_compress_command(
                 str(resource_path(RETRO_WATERMARK_FILE)),
                 "-filter_complex",
                 (
-                    "[0:v]crop=min(iw\\,ih):min(iw\\,ih),"
-                    "scale=480:480:flags=neighbor,fps=12[base];"
+                    f"[0:v]{RETRO_BASE_FILTER}[base];"
                     "[base][1:v]overlay=(W-w)/2:18:format=auto[vout]"
                 ),
                 "-map",
@@ -602,59 +597,6 @@ def process_compress(args: argparse.Namespace, *, quiet: bool = False) -> Operat
     )
 
 
-def process_optimize_gif(args: argparse.Namespace, *, quiet: bool = False) -> OperationResult:
-    try:
-        input_path = ensure_input_exists(args.input)
-        if input_path.suffix.lower() != ".gif":
-            raise ValueError("Режим оптимизации GIF принимает только файлы .gif.")
-        output_suffix = ".mp4" if args.gif_output_format == "MP4" else ".gif"
-        output_path = resolve_output_path(
-            input_path, args.output, "optimized", output_suffix=output_suffix
-        )
-        validate_output_path(input_path, output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    except (FileNotFoundError, ValueError) as exc:
-        raise OperationError(str(exc)) from exc
-
-    attempts = [(args.gif_fps, args.gif_colors)]
-    if output_suffix == ".gif" and args.target_size_mb:
-        attempts.extend(
-            (fps, colors)
-            for fps, colors in ((15, 128), (12, 96), (10, 64), (8, 48), (6, 32))
-            if (fps, colors) not in attempts
-        )
-
-    target_bytes = int(args.target_size_mb * 1024 * 1024) if args.target_size_mb else None
-    for fps, colors in attempts:
-        attempt_args = argparse.Namespace(**vars(args))
-        attempt_args.gif_fps = min(args.gif_fps, fps)
-        attempt_args.gif_colors = min(args.gif_colors, colors)
-        run_ffmpeg(
-            build_compress_command(attempt_args, input_path, output_path),
-            "Оптимизация GIF",
-            quiet=quiet,
-        )
-        if target_bytes is None or output_path.stat().st_size <= target_bytes:
-            break
-
-    details = [
-        f"GIF: {input_path.name}",
-        f"Формат результата: {output_suffix.removeprefix('.').upper()}",
-        f"Результат: {output_path.name}",
-        *compression_summary_lines(input_path, output_path),
-    ]
-    if target_bytes and output_path.stat().st_size > target_bytes:
-        details.append(
-            "Точный целевой вес недостижим с безопасными настройками; сохранён минимальный вариант."
-        )
-    return OperationResult(
-        action_name="Оптимизация GIF",
-        input_path=input_path,
-        output_path=output_path,
-        details=tuple(details),
-    )
-
-
 def process_trim(args: argparse.Namespace, *, quiet: bool = False) -> OperationResult:
     if args.end <= args.start:
         raise OperationError("Конечная секунда должна быть больше начальной.")
@@ -686,6 +628,625 @@ def process_trim(args: argparse.Namespace, *, quiet: bool = False) -> OperationR
     )
 
 
+@dataclass(frozen=True)
+class MediaInfo:
+    duration: float | None
+    width: int | None
+    height: int | None
+    fps: float | None
+    has_audio: bool
+
+
+def probe_media(input_path: Path) -> MediaInfo:
+    """Читает длительность, размер кадра, FPS и наличие звука через `ffmpeg -i`.
+
+    ffprobe в сборке нет (imageio-ffmpeg ставит только ffmpeg), поэтому
+    разбираем stderr самого ffmpeg.
+    """
+    try:
+        command = [get_ffmpeg_executable(), "-hide_banner", "-i", str(input_path)]
+    except RuntimeError:
+        return MediaInfo(None, None, None, None, False)
+
+    run_kwargs: dict[str, object] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        output = subprocess.run(command, **run_kwargs).stderr or ""
+    except OSError:
+        return MediaInfo(None, None, None, None, False)
+
+    duration = None
+    duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+    if duration_match:
+        hours, minutes, seconds = duration_match.groups()
+        duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        if duration <= 0:
+            duration = None
+
+    width = height = None
+    fps = None
+    video_line = next(
+        (line for line in output.splitlines() if "Stream #" in line and "Video:" in line),
+        "",
+    )
+    size_match = re.search(r"\b(\d{2,5})x(\d{2,5})\b", video_line)
+    if size_match:
+        width, height = int(size_match.group(1)), int(size_match.group(2))
+    fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", video_line) or re.search(
+        r"(\d+(?:\.\d+)?)\s*tbr", video_line
+    )
+    if fps_match:
+        fps = float(fps_match.group(1))
+
+    has_audio = any(
+        "Stream #" in line and "Audio:" in line for line in output.splitlines()
+    )
+    return MediaInfo(duration, width, height, fps, has_audio)
+
+
+def parse_size_limit(text: str) -> float:
+    return float(text.split()[0].replace(",", "."))
+
+
+def size_limit_bytes(limit_mb: float) -> int:
+    # Считаем в десятичных мегабайтах: так результат точно пролезет
+    # в лимит Discord, как бы он ни считал мегабайты.
+    return int(limit_mb * 1000 * 1000)
+
+
+@dataclass(frozen=True)
+class BitratePlan:
+    video_kbps: int
+    audio_kbps: int
+    max_short_side: int | None
+    fps_cap: int | None
+
+
+def plan_bitrate(
+    duration: float,
+    limit_mb: float,
+    *,
+    has_audio: bool,
+    info: MediaInfo | None = None,
+    fixed_frame: bool = False,
+) -> BitratePlan:
+    """Подбирает битрейт, разрешение и FPS, чтобы фрагмент влез в лимит."""
+    budget_kbps = size_limit_bytes(limit_mb) * 8 / 1000 / duration * 0.94
+    if not has_audio:
+        audio_kbps = 0
+    elif budget_kbps > 900:
+        audio_kbps = 96
+    elif budget_kbps > 300:
+        audio_kbps = 64
+    else:
+        audio_kbps = 32
+
+    video_kbps = int(min(budget_kbps - audio_kbps, MAX_TARGET_VIDEO_KBPS))
+    if video_kbps < 60:
+        max_seconds = size_limit_bytes(limit_mb) * 8 / 1000 * 0.94 / (60 + audio_kbps)
+        raise OperationError(
+            f"Фрагмент {format_duration(duration)} слишком длинный для "
+            f"{format_limit(limit_mb)}. Сократите его примерно до "
+            f"{format_duration(max_seconds)} или выберите лимит побольше."
+        )
+
+    max_short_side = None
+    fps_cap = None
+    if not fixed_frame:
+        if video_kbps >= 4000:
+            max_short_side = 1080
+        elif video_kbps >= 1800:
+            max_short_side = 720
+        elif video_kbps >= 700:
+            max_short_side = 480
+        else:
+            max_short_side = 360
+        source_fps = info.fps if info else None
+        if video_kbps < 3000 and (source_fps is None or source_fps > 31):
+            fps_cap = 30
+        if info and info.width and info.height:
+            short_side = min(info.width, info.height)
+            if short_side <= max_short_side:
+                max_short_side = None
+            # Короткому ролику не нужен весь бюджет: ~0.12 бита на пиксель
+            # уже даёт чистую картинку, лишние мегабайты только мешают.
+            scale = (max_short_side / short_side) if max_short_side else 1.0
+            out_fps = min(source_fps or 30, fps_cap or 240)
+            pixels = info.width * info.height * scale * scale
+            useful_kbps = int(pixels * out_fps * 0.12 / 1000)
+            video_kbps = min(video_kbps, max(600, useful_kbps))
+    return BitratePlan(video_kbps, audio_kbps, max_short_side, fps_cap)
+
+
+def format_limit(limit_mb: float) -> str:
+    return f"{format_seconds(limit_mb)} МБ"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    minutes, rest = divmod(seconds, 60)
+    if minutes >= 1:
+        return f"{int(minutes)}:{rest:04.1f}"
+    return f"{rest:.1f} сек"
+
+
+def describe_plan(plan: BitratePlan, info: MediaInfo | None) -> str:
+    parts = [f"видео ~{plan.video_kbps} кбит/с"]
+    if plan.audio_kbps:
+        parts.append(f"звук {plan.audio_kbps} кбит/с")
+    if plan.max_short_side:
+        parts.append(f"{plan.max_short_side}p")
+    elif info and info.width and info.height:
+        parts.append(f"{info.width}×{info.height}")
+    if plan.fps_cap:
+        parts.append(f"{plan.fps_cap} FPS")
+    return " · ".join(parts)
+
+
+EXPORT_MODES = ("discord", "retro", "gif", "custom")
+GIF_ASPECTS = {"Исходный": None, "1:1": (1, 1), "4:3": (4, 3), "16:9": (16, 9)}
+
+
+@dataclass
+class ExportJob:
+    input_path: Path
+    mode: str
+    output_path: Path | None = None
+    start: float = 0.0
+    end: float | None = None
+    size_limit_mb: float | None = DEFAULT_SIZE_LIMIT_MB
+    # GIF
+    gif_width: int | None = 480
+    gif_fps: int = 15
+    gif_colors: int = 128
+    gif_aspect: str = "Исходный"
+    gif_target_mb: float | None = None
+    # Своё сжатие
+    profile_title: str = "Стандартное сжатие"
+    width: int | None = None
+    height: int | None = None
+    keep_aspect: bool = True
+
+
+def export_output_suffix(mode: str) -> str:
+    return ".gif" if mode == "gif" else ".mp4"
+
+
+def export_output_tag(mode: str, input_path: Path) -> str:
+    if mode == "gif":
+        return "optimized" if input_path.suffix.lower() == ".gif" else "gif"
+    return {"discord": "discord", "retro": "2000s", "custom": "compressed"}[mode]
+
+
+def default_export_output(job: ExportJob) -> Path:
+    return resolve_output_path(
+        job.input_path,
+        None,
+        export_output_tag(job.mode, job.input_path),
+        output_suffix=export_output_suffix(job.mode),
+    )
+
+
+def fragment_input_args(job: ExportJob, info: MediaInfo) -> list[str]:
+    args: list[str] = []
+    if job.start > 0:
+        args.extend(["-ss", format_seconds(job.start)])
+    if job.end is not None and (info.duration is None or job.end < info.duration - 0.05):
+        args.extend(["-t", format_seconds(job.end - job.start)])
+    return args
+
+
+def fragment_duration(job: ExportJob, info: MediaInfo) -> float | None:
+    end = job.end if job.end is not None else info.duration
+    if end is None:
+        return None
+    if info.duration is not None:
+        end = min(end, info.duration)
+    return max(0.0, end - job.start)
+
+
+def short_side_scale(max_short_side: int) -> str:
+    return (
+        f"scale=w='if(gte(iw,ih),-2,{max_short_side})':"
+        f"h='if(gte(iw,ih),{max_short_side},-2)'"
+    )
+
+
+def build_export_video_command(
+    job: ExportJob,
+    info: MediaInfo,
+    output_path: Path,
+    *,
+    crf: int | None = None,
+    plan: BitratePlan | None = None,
+    pass_number: int | None = None,
+    passlog: Path | None = None,
+) -> list[str]:
+    retro = job.mode == "retro"
+    command = [
+        get_ffmpeg_executable(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        *fragment_input_args(job, info),
+        "-i",
+        str(job.input_path),
+    ]
+
+    if retro:
+        command.extend(
+            [
+                "-i",
+                str(resource_path(RETRO_WATERMARK_FILE)),
+                "-filter_complex",
+                (
+                    f"[0:v]{RETRO_BASE_FILTER}[base];"
+                    "[base][1:v]overlay=(W-w)/2:18:format=auto,format=yuv420p[vout]"
+                ),
+                "-map",
+                "[vout]",
+                "-map",
+                "0:a?",
+            ]
+        )
+    else:
+        filters: list[str] = []
+        if job.mode == "custom":
+            if not job.width and not job.height:
+                job.width = COMPRESSION_PROFILE_BY_TITLE[job.profile_title].width
+            if job.width and job.height:
+                scale = f"scale={job.width}:{job.height}"
+                if job.keep_aspect:
+                    scale += ":force_original_aspect_ratio=decrease"
+                filters.append(scale)
+                filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+            elif job.width:
+                filters.append(f"scale='min({job.width},iw)':-2")
+            elif job.height:
+                filters.append(f"scale=-2:{job.height}")
+        if plan is not None:
+            if plan.max_short_side:
+                filters.append(short_side_scale(plan.max_short_side))
+            if plan.fps_cap:
+                filters.append(f"fps={plan.fps_cap}")
+        # Чётные размеры нужны libx264 (например, для GIF с нечётной шириной).
+        filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        filters.append("format=yuv420p")
+        command.extend(["-vf", ",".join(filters), "-map", "0:v:0", "-map", "0:a?"])
+
+    preset = "veryfast" if retro and plan is None else "medium"
+    command.extend(["-c:v", "libx264", "-preset", preset])
+    if plan is not None:
+        command.extend(
+            [
+                "-b:v",
+                f"{plan.video_kbps}k",
+                "-maxrate",
+                f"{int(plan.video_kbps * 1.5)}k",
+                "-bufsize",
+                f"{plan.video_kbps * 2}k",
+            ]
+        )
+    else:
+        command.extend(["-crf", str(crf if crf is not None else 28)])
+
+    if pass_number is not None and passlog is not None:
+        command.extend(["-pass", str(pass_number), "-passlogfile", str(passlog)])
+
+    if pass_number == 1:
+        command.extend(["-an", "-f", "null", os.devnull])
+        return command
+
+    if not info.has_audio:
+        command.append("-an")
+    else:
+        if plan is not None:
+            audio_bitrate = f"{plan.audio_kbps}k"
+        elif retro:
+            audio_bitrate = "32k"
+        else:
+            audio_bitrate = COMPRESSION_PROFILE_BY_TITLE[job.profile_title].audio_bitrate
+        command.extend(["-c:a", "aac", "-b:a", audio_bitrate])
+        if retro:
+            command.extend(["-af", "volume=1.2"])
+
+    command.extend(["-movflags", "+faststart", str(output_path)])
+    return command
+
+
+def build_export_gif_command(
+    job: ExportJob, info: MediaInfo, output_path: Path, *, fps: int, colors: int
+) -> list[str]:
+    filters: list[str] = []
+    aspect = GIF_ASPECTS.get(job.gif_aspect)
+    if aspect:
+        filters.append(aspect_crop_filter(*aspect))
+    if job.gif_width:
+        filters.append(f"scale='min({job.gif_width},iw)':-2:flags=lanczos")
+    filters.append(f"fps={fps}")
+    gif_filter = (
+        f"[0:v]{','.join(filters)},split[palette_source][gif_source];"
+        f"[palette_source]palettegen=max_colors={colors}:stats_mode=diff[palette];"
+        "[gif_source][palette]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle[vout]"
+    )
+    return [
+        get_ffmpeg_executable(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        *fragment_input_args(job, info),
+        "-i",
+        str(job.input_path),
+        "-filter_complex",
+        gif_filter,
+        "-map",
+        "[vout]",
+        "-an",
+        "-loop",
+        "0",
+        str(output_path),
+    ]
+
+
+ProgressCallback = Callable[[float], None] | None
+
+
+def run_ffmpeg_with_progress(
+    command: list[str],
+    action_name: str,
+    *,
+    duration: float | None,
+    on_progress: ProgressCallback = None,
+    progress_range: tuple[float, float] = (0.0, 1.0),
+    cwd: Path | None = None,
+) -> None:
+    """Запускает ffmpeg с `-progress pipe:1` и сообщает долю выполнения."""
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(cwd) if cwd else None,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except OSError as exc:
+        raise OperationError(f"Не удалось запустить ffmpeg: {exc}") from exc
+
+    stderr_chunks: list[str] = []
+
+    def drain_stderr() -> None:
+        assert process.stderr is not None
+        stderr_chunks.append(process.stderr.read())
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    low, high = progress_range
+    assert process.stdout is not None
+    for line in process.stdout:
+        if not on_progress or not duration:
+            continue
+        key, _, value = line.strip().partition("=")
+        if key in {"out_time_us", "out_time_ms"} and value.isdigit():
+            fraction = min(1.0, int(value) / 1_000_000 / duration)
+            on_progress(low + (high - low) * fraction)
+
+    return_code = process.wait()
+    stderr_thread.join(timeout=5)
+    if return_code != 0:
+        stderr = "".join(stderr_chunks).strip()
+        error_text = f"\n\n{stderr[-2000:]}" if stderr else ""
+        raise OperationError(
+            f"{action_name} завершилось с ошибкой, код: {return_code}.{error_text}",
+            exit_code=return_code,
+        )
+    if on_progress:
+        on_progress(high)
+
+
+def encode_to_size(
+    job: ExportJob,
+    info: MediaInfo,
+    output_path: Path,
+    duration: float,
+    *,
+    on_progress: ProgressCallback,
+    progress_range: tuple[float, float],
+) -> tuple[BitratePlan, int]:
+    """Двухпроходное кодирование под лимит; при перелёте повторяет с меньшим битрейтом."""
+    assert job.size_limit_mb is not None
+    limit_bytes = size_limit_bytes(job.size_limit_mb)
+    plan = plan_bitrate(
+        duration,
+        job.size_limit_mb,
+        has_audio=info.has_audio,
+        info=info,
+        fixed_frame=job.mode == "retro",
+    )
+    low, high = progress_range
+    middle = (low + high) / 2
+    attempts = 3
+    with tempfile.TemporaryDirectory(prefix="cusini_") as temp_dir:
+        # Относительный путь + cwd: x264 под Windows не открывает
+        # файл статистики, если в пути есть кириллица.
+        passlog = Path("x264pass")
+        for attempt in range(attempts):
+            for pass_number, sub_range in ((1, (low, middle)), (2, (middle, high))):
+                run_ffmpeg_with_progress(
+                    build_export_video_command(
+                        job,
+                        info,
+                        output_path,
+                        plan=plan,
+                        pass_number=pass_number,
+                        passlog=passlog,
+                    ),
+                    "Кодирование",
+                    duration=duration,
+                    on_progress=on_progress,
+                    progress_range=sub_range,
+                    cwd=Path(temp_dir),
+                )
+            actual = output_path.stat().st_size
+            if actual <= limit_bytes:
+                return plan, attempt + 1
+            ratio = limit_bytes / actual * 0.97
+            plan = BitratePlan(
+                max(50, int(plan.video_kbps * ratio)),
+                plan.audio_kbps,
+                plan.max_short_side,
+                plan.fps_cap,
+            )
+    return plan, attempts
+
+
+def process_export(job: ExportJob, *, on_progress: ProgressCallback = None) -> OperationResult:
+    if job.mode not in EXPORT_MODES:
+        raise OperationError(f"Неизвестный режим: {job.mode}")
+    try:
+        input_path = ensure_input_exists(job.input_path)
+        job.input_path = input_path
+        output_path = resolve_output_path(
+            input_path,
+            job.output_path,
+            export_output_tag(job.mode, input_path),
+            output_suffix=export_output_suffix(job.mode),
+        )
+        validate_output_path(input_path, output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except (FileNotFoundError, ValueError) as exc:
+        raise OperationError(str(exc)) from exc
+
+    if job.end is not None and job.end <= job.start:
+        raise OperationError("Конец фрагмента должен быть позже начала.")
+
+    info = probe_media(input_path)
+    duration = fragment_duration(job, info)
+    if duration is not None and duration <= 0:
+        raise OperationError("Начало фрагмента находится за концом видео.")
+
+    action_name = {
+        "discord": "Сжатие для Discord",
+        "retro": "Шакал 2000-х",
+        "gif": "GIF",
+        "custom": "Сжатие",
+    }[job.mode]
+    details = [f"Файл: {input_path.name}"]
+    if fragment_input_args(job, info) and duration is not None:
+        details.append(
+            f"Фрагмент: {format_seconds(job.start)}–"
+            f"{format_seconds(job.start + duration)} сек ({format_duration(duration)})"
+        )
+
+    if job.mode == "gif":
+        attempts = [(job.gif_fps, job.gif_colors)]
+        if job.gif_target_mb:
+            attempts.extend(
+                (min(job.gif_fps, fps), min(job.gif_colors, colors))
+                for fps, colors in ((15, 128), (12, 96), (10, 64), (8, 48), (6, 32))
+            )
+            attempts = list(dict.fromkeys(attempts))
+        target_bytes = size_limit_bytes(job.gif_target_mb) if job.gif_target_mb else None
+        for index, (fps, colors) in enumerate(attempts):
+            run_ffmpeg_with_progress(
+                build_export_gif_command(job, info, output_path, fps=fps, colors=colors),
+                action_name,
+                duration=duration,
+                on_progress=on_progress,
+                progress_range=(index / len(attempts), (index + 1) / len(attempts)),
+            )
+            if target_bytes is None or output_path.stat().st_size <= target_bytes:
+                details.append(f"GIF: {fps} FPS, {colors} цветов")
+                break
+        else:
+            details.append(
+                "Целевой вес недостижим с безопасными настройками; сохранён минимальный вариант."
+            )
+    elif job.mode in {"discord", "retro"} and job.size_limit_mb:
+        if duration is None:
+            raise OperationError(
+                "Не удалось определить длительность видео — без неё нельзя подобрать битрейт."
+            )
+        limit_bytes = size_limit_bytes(job.size_limit_mb)
+        fitted = False
+        if job.mode == "retro":
+            # Сначала шакалим по CRF — обычно этого хватает с запасом.
+            run_ffmpeg_with_progress(
+                build_export_video_command(job, info, output_path, crf=36),
+                action_name,
+                duration=duration,
+                on_progress=on_progress,
+                progress_range=(0.0, 0.5),
+            )
+            fitted = output_path.stat().st_size <= limit_bytes
+            if fitted and on_progress:
+                on_progress(1.0)
+        if not fitted:
+            plan, passes = encode_to_size(
+                job,
+                info,
+                output_path,
+                duration,
+                on_progress=on_progress,
+                progress_range=(0.5 if job.mode == "retro" else 0.0, 1.0),
+            )
+            frame_info = (
+                MediaInfo(None, RETRO_WIDTH, RETRO_HEIGHT, RETRO_FPS, info.has_audio)
+                if job.mode == "retro"
+                else info
+            )
+            details.append(f"Битрейт: {describe_plan(plan, frame_info)}")
+            if passes > 1:
+                details.append(f"Понадобилось попыток: {passes}")
+    else:
+        crf = (
+            36
+            if job.mode == "retro"
+            else COMPRESSION_PROFILE_BY_TITLE[job.profile_title].crf
+        )
+        run_ffmpeg_with_progress(
+            build_export_video_command(job, info, output_path, crf=crf),
+            action_name,
+            duration=duration,
+            on_progress=on_progress,
+        )
+
+    details.append(f"Результат: {output_path.name}")
+    details.extend(compression_summary_lines(input_path, output_path))
+    if job.size_limit_mb and job.mode in {"discord", "retro"}:
+        fits = output_path.stat().st_size <= size_limit_bytes(job.size_limit_mb)
+        details.append(
+            f"Лимит {format_limit(job.size_limit_mb)}: {'влезает' if fits else 'НЕ влезает'}"
+        )
+
+    return OperationResult(
+        action_name=action_name,
+        input_path=input_path,
+        output_path=output_path,
+        details=tuple(details),
+    )
+
+
 def print_operation_result(result: OperationResult) -> None:
     for line in result.details:
         print(line)
@@ -705,6 +1266,28 @@ def run_compress(args: argparse.Namespace) -> int:
 def run_trim(args: argparse.Namespace) -> int:
     try:
         result = process_trim(args)
+    except OperationError as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.exit_code
+
+    print_operation_result(result)
+    return 0
+
+
+def run_export(args: argparse.Namespace) -> int:
+    job = ExportJob(
+        input_path=args.input,
+        mode=args.mode,
+        output_path=args.output,
+        start=args.start,
+        end=args.end,
+        size_limit_mb=args.limit,
+        gif_width=args.gif_width,
+        gif_fps=args.gif_fps,
+        gif_aspect=args.gif_aspect or "Исходный",
+    )
+    try:
+        result = process_export(job)
     except OperationError as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code
@@ -987,15 +1570,29 @@ def run_menu() -> int:
 
 if tk is not None and ttk is not None and filedialog is not None and messagebox is not None:
     class VideoToolApp:
+        MODE_SPECS = (
+            ("discord", "В DISCORD", "влезет в лимит"),
+            ("retro", "ШАКАЛ 2000-Х", "4:3 · 12 FPS · Bandicam"),
+            ("gif", "GIF", "из видео или GIF"),
+            ("custom", "СВОЁ", "ручные настройки"),
+        )
+        RUN_LABELS = {
+            "discord": "▶  СЖАТЬ ДЛЯ DISCORD",
+            "retro": "▶  СДЕЛАТЬ ШАКАЛ 2000-Х",
+            "gif": "▶  СДЕЛАТЬ GIF",
+            "custom": "▶  СЖАТЬ",
+        }
+
         def __init__(self, root: tk.Tk) -> None:
             self.root = root
             self.root.title(APP_TITLE)
             self.root.geometry("1180x780")
-            self.root.minsize(1060, 700)
+            self.root.minsize(1060, 740)
 
             self.selected_input: Path | None = None
+            self.media_info: MediaInfo | None = None
+            self.custom_output: Path | None = None
             self.last_output_path: Path | None = None
-            self.auto_output_path: str | None = None
             self.worker_thread: threading.Thread | None = None
             self.is_busy = False
             self.header_photo: object | None = None
@@ -1006,29 +1603,30 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             self._syncing_trim_controls = False
 
             self.input_path_var = tk.StringVar()
-            self.input_info_var = tk.StringVar(value="Файл не выбран.")
-            self.output_path_var = tk.StringVar()
-            self.status_var = tk.StringVar(value="Выберите видеофайл и нужное действие.")
+            self.input_info_var = tk.StringVar(
+                value="Файл не выбран. Подойдут MP4, MOV, MKV, WEBM, AVI, GIF и другие."
+            )
+            self.status_var = tk.StringVar(value="Выберите файл, фрагмент и что с ним сделать.")
+            self.mode_var = tk.StringVar(value="discord")
+            self.limit_var = tk.StringVar(value=f"{DEFAULT_SIZE_LIMIT_MB} МБ")
+            self.plan_var = tk.StringVar()
+            self.output_var = tk.StringVar()
             self.profile_var = tk.StringVar(value=COMPRESSION_PROFILES[1].title)
             self.profile_description_var = tk.StringVar()
-            self.resize_mode_var = tk.StringVar(value="Исходный размер")
+            self.resize_mode_var = tk.StringVar(value="Как в пресете")
             self.resize_width_var = tk.StringVar()
             self.resize_height_var = tk.StringVar()
             self.keep_aspect_var = tk.BooleanVar(value=True)
-            self.gif_size_var = tk.StringVar(value="480 px")
+            self.gif_width_var = tk.StringVar(value="480 px")
+            self.gif_aspect_var = tk.StringVar(value="Исходный")
             self.gif_fps_var = tk.StringVar(value="15")
             self.gif_colors_var = tk.StringVar(value="128")
             self.gif_target_mb_var = tk.StringVar()
-            self.gif_output_format_var = tk.StringVar(value="GIF")
-            self.operation_mode_var = tk.StringVar(value="compress")
             self.trim_start_var = tk.StringVar(value="0")
-            self.trim_end_var = tk.StringVar(value="10")
+            self.trim_end_var = tk.StringVar(value=format_seconds(DEFAULT_TRIM_DURATION))
             self.trim_start_scale_var = tk.DoubleVar(value=0)
-            self.trim_end_scale_var = tk.DoubleVar(value=10)
-            self.trim_duration_var = tk.StringVar(
-                value=f"Диапазон ползунков: 0-{format_seconds(DEFAULT_TRIM_DURATION)} сек"
-            )
-            self.trim_selection_duration_var = tk.StringVar(value="ДЛИТЕЛЬНОСТЬ: 10 сек")
+            self.trim_end_scale_var = tk.DoubleVar(value=DEFAULT_TRIM_DURATION)
+            self.trim_selection_var = tk.StringVar(value="Всё видео")
 
             self.interactive_widgets: list[object] = []
 
@@ -1036,7 +1634,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             self._load_assets()
             self._build_ui()
             self._refresh_profile_state()
-            self._update_run_button_text()
+            self._select_mode("discord")
 
         def _configure_style(self) -> None:
             style = ttk.Style()
@@ -1158,7 +1756,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 bordercolor="#374149",
                 lightcolor="#374149",
                 darkcolor="#06090B",
-                padding=(16, 10),
+                padding=(14, 7),
                 font=("Segoe UI", 9, "bold"),
             )
             style.map("Dota.TButton", background=[("active", "#222C33"), ("disabled", "#11161A")])
@@ -1169,7 +1767,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 bordercolor="#374149",
                 lightcolor="#374149",
                 darkcolor="#06090B",
-                padding=(12, 18),
+                padding=(10, 8),
                 font=("Segoe UI Semibold", 10),
                 anchor="center",
                 justify="center",
@@ -1182,7 +1780,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 bordercolor=colors["red_hover"],
                 lightcolor=colors["red_hover"],
                 darkcolor="#6B2115",
-                padding=(12, 18),
+                padding=(10, 8),
                 font=("Segoe UI Semibold", 10),
                 anchor="center",
                 justify="center",
@@ -1198,7 +1796,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 bordercolor="#759A48",
                 lightcolor="#759A48",
                 darkcolor="#253B18",
-                padding=(22, 13),
+                padding=(22, 11),
                 font=("Segoe UI Semibold", 11),
             )
             style.map(
@@ -1214,7 +1812,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 bordercolor=colors["border"],
                 lightcolor=colors["border"],
                 darkcolor="#030506",
-                padding=9,
+                padding=6,
             )
             style.configure(
                 "TCombobox",
@@ -1258,7 +1856,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 background=colors["red"],
                 troughcolor=colors["panel_alt"],
                 borderwidth=0,
-                thickness=3,
+                thickness=6,
             )
 
         def _load_assets(self) -> None:
@@ -1267,11 +1865,11 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 self.root.iconphoto(True, self.window_icon_photo)
 
             self.header_photo = self._load_photo(HEADER_IMAGE_FILE, (330, 220))
-            self.dota_logo_photo = self._load_photo(DOTA_LOGO_FILE, (62, 62))
+            self.dota_logo_photo = self._load_photo(DOTA_LOGO_FILE, (50, 50))
             self.mode_photos = {
                 mode: photo
                 for mode, filename in MODE_ICON_FILES.items()
-                if (photo := self._load_photo(filename, (68, 68))) is not None
+                if (photo := self._load_photo(filename, (56, 56))) is not None
             }
 
         def _load_photo(self, filename: str, size: tuple[int, int]) -> object | None:
@@ -1283,12 +1881,25 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             resized = ImageOps.fit(image, size, method=Image.Resampling.LANCZOS)
             return ImageTk.PhotoImage(resized)
 
+        def _section_title(self, parent: object, text: str, row: int) -> None:
+            ttk.Label(parent, text=text, style="SectionTitle.TLabel").grid(
+                row=row, column=0, sticky="w"
+            )
+
+        def _combo(self, parent: object, variable: tk.StringVar, values: tuple[str, ...], width: int) -> ttk.Combobox:
+            combo = ttk.Combobox(
+                parent, textvariable=variable, values=values, state="readonly", width=width
+            )
+            combo.bind("<<ComboboxSelected>>", self._on_setting_changed)
+            self.interactive_widgets.append(combo)
+            return combo
+
         def _build_ui(self) -> None:
             colors = self.colors
             shell = ttk.Frame(self.root, style="App.TFrame")
             shell.pack(fill="both", expand=True)
 
-            header = ttk.Frame(shell, padding=(24, 15), style="Top.TFrame")
+            header = ttk.Frame(shell, padding=(24, 8), style="Top.TFrame")
             header.pack(fill="x")
             if self.dota_logo_photo is not None:
                 tk.Label(
@@ -1305,25 +1916,23 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             red_line = tk.Frame(shell, background=colors["red"], height=2)
             red_line.pack(fill="x")
 
-            main = ttk.Frame(shell, padding=(20, 14), style="App.TFrame")
+            main = ttk.Frame(shell, padding=(20, 12), style="App.TFrame")
             main.pack(fill="both", expand=True)
             main.columnconfigure(0, weight=13)
-            main.columnconfigure(1, weight=7)
+            main.columnconfigure(1, weight=6)
             main.rowconfigure(0, weight=1)
 
-            workspace = ttk.Frame(main, padding=16, style="Panel.TFrame")
+            workspace = ttk.Frame(main, padding=(16, 12), style="Panel.TFrame")
             workspace.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
             workspace.columnconfigure(0, weight=1)
 
-            ttk.Label(workspace, text="ВЫБЕРИТЕ ВИДЕО", style="SectionTitle.TLabel").grid(
-                row=0, column=0, sticky="w"
-            )
-            file_panel = ttk.Frame(workspace, padding=16, style="Inset.TFrame")
-            file_panel.grid(row=1, column=0, sticky="ew", pady=(10, 16))
+            # 1 · Файл
+            self._section_title(workspace, "1 · ФАЙЛ", 0)
+            file_panel = ttk.Frame(workspace, padding=12, style="Inset.TFrame")
+            file_panel.grid(row=1, column=0, sticky="ew", pady=(6, 10))
             file_panel.columnconfigure(0, weight=1)
             input_entry = ttk.Entry(file_panel, textvariable=self.input_path_var, state="readonly")
             input_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-
             browse_button = ttk.Button(
                 file_panel,
                 text="ВЫБРАТЬ ФАЙЛ",
@@ -1335,101 +1944,104 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             ttk.Label(
                 file_panel,
                 textvariable=self.input_info_var,
-                style="Hint.TLabel",
-                wraplength=610,
+                style="SettingHint.TLabel",
+                wraplength=640,
                 justify="left",
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-            ttk.Label(workspace, text="ВЫБЕРИТЕ РЕЖИМ", style="SectionTitle.TLabel").grid(
-                row=2, column=0, sticky="w"
-            )
+            # 2 · Фрагмент
+            self._section_title(workspace, "2 · ФРАГМЕНТ", 2)
+            self.trim_panel = ttk.Frame(workspace, padding=(12, 10), style="Inset.TFrame")
+            self.trim_panel.grid(row=3, column=0, sticky="ew", pady=(6, 10))
+            self._build_trim_panel()
+
+            # 3 · Что сделать
+            self._section_title(workspace, "3 · ЧТО СДЕЛАТЬ", 4)
             mode_cards = ttk.Frame(workspace, style="Panel.TFrame")
-            mode_cards.grid(row=3, column=0, sticky="ew", pady=(10, 12))
-            for column in range(4):
+            mode_cards.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+            for column in range(len(self.MODE_SPECS)):
                 mode_cards.columnconfigure(column, weight=1, uniform="mode")
 
             self.mode_buttons: dict[str, ttk.Button] = {}
-            mode_specs = [
-                ("compress", "СЖАТЬ ВИДЕО\nУменьшить размер"),
-                ("trim", "ОБРЕЗАТЬ\nПО ВРЕМЕНИ"),
-                ("retro", "КВАДРАТ\nИЗ 2000-Х"),
-                ("gif", "ОПТИМИЗИРОВАТЬ\nGIF"),
-            ]
-            for column, (mode, label) in enumerate(mode_specs):
+            last_column = len(self.MODE_SPECS) - 1
+            for column, (mode, title, subtitle) in enumerate(self.MODE_SPECS):
                 button = ttk.Button(
                     mode_cards,
-                    text=label,
-                    image=self.mode_photos.get(
-                        "compress" if mode == "gif" else mode, ""
-                    ),
+                    text=f"{title}\n{subtitle}",
+                    image=self.mode_photos.get(mode, ""),
                     compound="top",
-                    command=lambda selected_mode=mode: self._select_operation_mode(selected_mode),
+                    command=lambda selected_mode=mode: self._select_mode(selected_mode),
                     style="Mode.TButton",
                 )
                 button.grid(
                     row=0,
                     column=column,
                     sticky="nsew",
-                    padx=(0 if column == 0 else 4, 0 if column == 3 else 4),
+                    padx=(0 if column == 0 else 4, 0 if column == last_column else 4),
                 )
                 self.mode_buttons[mode] = button
                 self.interactive_widgets.append(button)
 
-            self.settings_host = ttk.Frame(workspace, padding=(14, 12), style="Inset.TFrame")
-            self.settings_host.grid(row=4, column=0, sticky="ew", pady=(0, 14))
+            self.settings_host = ttk.Frame(workspace, padding=(14, 10), style="Inset.TFrame")
+            self.settings_host.grid(row=6, column=0, sticky="ew", pady=(8, 10))
             self.settings_host.columnconfigure(0, weight=1)
+            self.settings_host.rowconfigure(0, minsize=72)
+            self.mode_frames = {
+                mode: ttk.Frame(self.settings_host, style="Inset.TFrame")
+                for mode, _title, _subtitle in self.MODE_SPECS
+            }
+            self._build_discord_settings()
+            self._build_retro_settings()
+            self._build_gif_settings()
+            self._build_custom_settings()
 
-            self.compress_tab = ttk.Frame(self.settings_host, style="Inset.TFrame")
-            self.trim_tab = ttk.Frame(self.settings_host, style="Inset.TFrame")
-            self.retro_tab = ttk.Frame(self.settings_host, style="Inset.TFrame")
-            self.gif_tab = ttk.Frame(self.settings_host, style="Inset.TFrame")
-            self._build_compress_tab()
-            self._build_trim_tab()
-            self._build_retro_tab()
-            self._build_gif_tab()
-
-            ttk.Label(workspace, text="РЕЗУЛЬТАТ", style="SectionTitle.TLabel").grid(
-                row=5, column=0, sticky="w"
+            # Результат и запуск
+            output_row = ttk.Frame(workspace, style="Panel.TFrame")
+            output_row.grid(row=7, column=0, sticky="ew", pady=(0, 10))
+            output_row.columnconfigure(0, weight=1)
+            ttk.Label(
+                output_row,
+                textvariable=self.output_var,
+                style="Hint.TLabel",
+                wraplength=520,
+                justify="left",
+            ).grid(row=0, column=0, sticky="w")
+            self.reset_output_button = ttk.Button(
+                output_row, text="РЯДОМ С ИСХОДНИКОМ", command=self.reset_output_path, style="Dota.TButton"
             )
-            output_frame = ttk.Frame(workspace, padding=14, style="Inset.TFrame")
-            output_frame.grid(row=6, column=0, sticky="ew", pady=(10, 14))
-            output_frame.columnconfigure(0, weight=1)
-            output_entry = ttk.Entry(output_frame, textvariable=self.output_path_var)
-            output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-            self.interactive_widgets.append(output_entry)
-
-            auto_button = ttk.Button(
-                output_frame, text="АВТО", command=self.use_auto_output_path, style="Dota.TButton"
+            self.reset_output_button.grid(row=0, column=1, padx=(8, 0))
+            self.reset_output_button.grid_remove()
+            save_as_button = ttk.Button(
+                output_row, text="СОХРАНИТЬ КАК…", command=self.choose_output_file, style="Dota.TButton"
             )
-            auto_button.grid(row=0, column=1, padx=(0, 8))
-            self.interactive_widgets.append(auto_button)
-            output_button = ttk.Button(
-                output_frame, text="ОБЗОР", command=self.choose_output_file, style="Dota.TButton"
-            )
-            output_button.grid(row=0, column=2)
-            self.interactive_widgets.append(output_button)
+            save_as_button.grid(row=0, column=2, padx=(8, 0))
+            self.interactive_widgets.extend([self.reset_output_button, save_as_button])
 
             actions = ttk.Frame(workspace, style="Panel.TFrame")
-            actions.grid(row=7, column=0, sticky="ew")
+            actions.grid(row=8, column=0, sticky="ew")
             actions.columnconfigure(0, weight=1)
             self.run_button = ttk.Button(
-                actions, text="ЗАПУСТИТЬ", command=self.start_operation, style="Primary.TButton"
+                actions, text="▶", command=self.start_operation, style="Primary.TButton"
             )
             self.run_button.grid(row=0, column=0, sticky="ew")
             self.interactive_widgets.append(self.run_button)
             self.open_folder_button = ttk.Button(
                 actions,
-                text="ОТКРЫТЬ ПАПКУ",
+                text="ПОКАЗАТЬ ФАЙЛ",
                 command=self.open_output_folder,
                 state="disabled",
                 style="Dota.TButton",
             )
-            self.open_folder_button.grid(row=0, column=1, padx=(10, 0))
-            self._select_operation_mode("compress", refresh_output=False)
+            self.open_folder_button.grid(row=0, column=1, padx=(10, 0), sticky="ns")
 
+            self._build_sidebar(main)
+
+        def _build_sidebar(self, main: object) -> None:
+            colors = self.colors
             sidebar = ttk.Frame(main, padding=16, style="Panel.TFrame")
             sidebar.grid(row=0, column=1, sticky="nsew")
             sidebar.columnconfigure(0, weight=1)
+            sidebar.rowconfigure(7, weight=1)
 
             ttk.Label(sidebar, text="ЗА ДЕЛО БЕРЕТСЯ МЯСНИК", style="SectionTitle.TLabel").grid(
                 row=0, column=0, sticky="w"
@@ -1448,7 +2060,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 text="Ой... это я что ли?",
                 style="ProfileTitle.TLabel",
                 justify="center",
-            ).grid(row=2, column=0, sticky="ew", pady=(0, 16))
+            ).grid(row=2, column=0, sticky="ew", pady=(0, 14))
 
             ttk.Label(sidebar, text="СТАТУС", style="SectionTitle.TLabel").grid(
                 row=3, column=0, sticky="w"
@@ -1457,17 +2069,17 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 sidebar,
                 textvariable=self.status_var,
                 style="Hint.TLabel",
-                wraplength=260,
+                wraplength=300,
                 justify="left",
             ).grid(row=4, column=0, sticky="ew", pady=(8, 10))
-            self.progress = ttk.Progressbar(sidebar, mode="indeterminate")
-            self.progress.grid(row=5, column=0, sticky="ew", pady=(0, 16))
+            self.progress = ttk.Progressbar(sidebar, mode="determinate", maximum=100)
+            self.progress.grid(row=5, column=0, sticky="ew", pady=(0, 14))
 
             ttk.Label(sidebar, text="ЖУРНАЛ", style="SectionTitle.TLabel").grid(
                 row=6, column=0, sticky="w", pady=(0, 8)
             )
             log_frame = ttk.Frame(sidebar, style="Inset.TFrame")
-            log_frame.grid(row=7, column=0, sticky="ew")
+            log_frame.grid(row=7, column=0, sticky="nsew")
             log_frame.columnconfigure(0, weight=1)
             log_frame.rowconfigure(0, weight=1)
             self.log_text = tk.Text(
@@ -1491,62 +2103,158 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             scrollbar.grid(row=0, column=1, sticky="ns")
             self.log_text.configure(yscrollcommand=scrollbar.set)
 
-        def _build_compress_tab(self) -> None:
-            self.compress_tab.columnconfigure(1, weight=1)
+        def _build_trim_panel(self) -> None:
+            panel = self.trim_panel
+            panel.columnconfigure(1, weight=1)
 
-            ttk.Label(self.compress_tab, text="Пресет:", style="Setting.TLabel").grid(
-                row=0, column=0, sticky="w"
-            )
-            profile_combo = ttk.Combobox(
-                self.compress_tab,
-                textvariable=self.profile_var,
-                values=[profile.title for profile in COMPRESSION_PROFILES if not profile.retro_square],
-                state="readonly",
-            )
-            profile_combo.grid(row=0, column=1, sticky="ew")
-            profile_combo.bind("<<ComboboxSelected>>", self._on_profile_changed)
-            self.interactive_widgets.append(profile_combo)
+            for row, (label, scale_var, entry_var, handler) in enumerate(
+                (
+                    ("Начало:", self.trim_start_scale_var, self.trim_start_var, self._on_trim_start_scale),
+                    ("Конец:", self.trim_end_scale_var, self.trim_end_var, self._on_trim_end_scale),
+                )
+            ):
+                ttk.Label(panel, text=label, style="Setting.TLabel").grid(
+                    row=row, column=0, sticky="w", pady=(0, 6)
+                )
+                scale = ttk.Scale(
+                    panel, from_=0, to=self.trim_duration, variable=scale_var, command=handler
+                )
+                scale.grid(row=row, column=1, sticky="ew", padx=12, pady=(0, 6))
+                entry = ttk.Entry(panel, textvariable=entry_var, width=9)
+                entry.grid(row=row, column=2, sticky="e", pady=(0, 6))
+                entry.bind("<FocusOut>", self._on_trim_entry_changed)
+                entry.bind("<Return>", self._on_trim_entry_changed)
+                ttk.Label(panel, text="сек", style="SettingHint.TLabel").grid(
+                    row=row, column=3, sticky="w", padx=(6, 0), pady=(0, 6)
+                )
+                self.interactive_widgets.extend([scale, entry])
+                if row == 0:
+                    self.trim_start_scale = scale
+                else:
+                    self.trim_end_scale = scale
 
             ttk.Label(
-                self.compress_tab,
-                textvariable=self.profile_description_var,
-                style="SettingTitle.TLabel",
-                wraplength=760,
+                panel, textvariable=self.trim_selection_var, style="SettingValue.TLabel"
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            full_button = ttk.Button(
+                panel, text="ВСЁ ВИДЕО", command=self.select_full_range, style="Dota.TButton"
+            )
+            full_button.grid(row=2, column=2, columnspan=2, sticky="e", pady=(2, 0))
+            self.interactive_widgets.append(full_button)
+
+        def _build_discord_settings(self) -> None:
+            frame = self.mode_frames["discord"]
+            frame.columnconfigure(2, weight=1)
+            ttk.Label(frame, text="Лимит:", style="Setting.TLabel").grid(row=0, column=0, sticky="w")
+            self._combo(frame, self.limit_var, SIZE_LIMIT_OPTIONS, 8).grid(
+                row=0, column=1, sticky="w", padx=(8, 14)
+            )
+            ttk.Label(
+                frame,
+                textvariable=self.plan_var,
+                style="SettingValue.TLabel",
+                wraplength=520,
                 justify="left",
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 6))
-
+            ).grid(row=0, column=2, sticky="w")
             ttk.Label(
-                self.compress_tab,
-                text="Процент сжатия примерный и зависит от исходного видео. Уже сильно сжатые ролики могут уменьшиться слабее.",
+                frame,
+                text="Битрейт и разрешение подбираются под длину фрагмента. 10 МБ — Discord без Nitro.",
                 style="SettingHint.TLabel",
-                wraplength=760,
+                wraplength=720,
                 justify="left",
-            ).grid(row=2, column=0, columnspan=2, sticky="w")
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-            resize_row = ttk.Frame(self.compress_tab, style="Inset.TFrame")
-            resize_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-            resize_row.columnconfigure(5, weight=1)
+        def _build_retro_settings(self) -> None:
+            frame = self.mode_frames["retro"]
+            frame.columnconfigure(2, weight=1)
+            ttk.Label(frame, text="Лимит:", style="Setting.TLabel").grid(row=0, column=0, sticky="w")
+            self._combo(frame, self.limit_var, SIZE_LIMIT_OPTIONS, 8).grid(
+                row=0, column=1, sticky="w", padx=(8, 14)
+            )
+            ttk.Label(
+                frame,
+                text="ШАКАЛЬНАЯ ЗАПИСЬ РАБОЧЕГО СТОЛА",
+                style="SettingTitle.TLabel",
+            ).grid(row=0, column=2, sticky="w")
+            ttk.Label(
+                frame,
+                text=(
+                    f"Кроп по центру в 4:3 · {RETRO_WIDTH}×{RETRO_HEIGHT} · {RETRO_FPS} FPS · "
+                    "звук +20% · watermark Bandicam. Не влезет — дошакалим."
+                ),
+                style="SettingHint.TLabel",
+                wraplength=620,
+                justify="left",
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        def _build_gif_settings(self) -> None:
+            frame = self.mode_frames["gif"]
+            frame.columnconfigure(5, weight=1)
+            fields = (
+                ("Ширина:", self.gif_width_var, ("Исходная", "720 px", "480 px", "320 px", "240 px")),
+                ("Кадр:", self.gif_aspect_var, tuple(GIF_ASPECTS)),
+                ("FPS:", self.gif_fps_var, ("25", "20", "15", "12", "10", "8")),
+                ("Цвета:", self.gif_colors_var, ("256", "128", "96", "64", "32")),
+            )
+            for index, (label, variable, values) in enumerate(fields):
+                row, pair = divmod(index, 2)
+                column = pair * 2
+                ttk.Label(frame, text=label, style="Setting.TLabel").grid(
+                    row=row,
+                    column=column,
+                    sticky="w",
+                    padx=(0 if column == 0 else 22, 8),
+                    pady=(0 if row == 0 else 8, 0),
+                )
+                self._combo(frame, variable, values, 10).grid(
+                    row=row, column=column + 1, sticky="w", pady=(0 if row == 0 else 8, 0)
+                )
+
+            ttk.Label(frame, text="Макс. вес:", style="Setting.TLabel").grid(
+                row=0, column=4, sticky="w", padx=(22, 8)
+            )
+            target_entry = ttk.Entry(frame, textvariable=self.gif_target_mb_var, width=6)
+            target_entry.grid(row=0, column=5, sticky="w")
+            self.interactive_widgets.append(target_entry)
+            ttk.Label(
+                frame,
+                text="МБ, необязательно — снизим FPS и цвета",
+                style="SettingHint.TLabel",
+            ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(22, 0), pady=(8, 0))
+
+        def _build_custom_settings(self) -> None:
+            frame = self.mode_frames["custom"]
+            frame.columnconfigure(2, weight=1)
+
+            ttk.Label(frame, text="Пресет:", style="Setting.TLabel").grid(row=0, column=0, sticky="w")
+            profile_combo = self._combo(
+                frame,
+                self.profile_var,
+                tuple(profile.title for profile in COMPRESSION_PROFILES if not profile.retro_square),
+                22,
+            )
+            profile_combo.grid(row=0, column=1, sticky="w", padx=(8, 12))
+            ttk.Label(
+                frame,
+                textvariable=self.profile_description_var,
+                style="SettingHint.TLabel",
+                wraplength=340,
+                justify="left",
+            ).grid(row=0, column=2, sticky="w")
+
+            resize_row = ttk.Frame(frame, style="Inset.TFrame")
+            resize_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
             ttk.Label(resize_row, text="Размер:", style="Setting.TLabel").grid(
                 row=0, column=0, sticky="w"
             )
-            resize_combo = ttk.Combobox(
-                resize_row,
-                textvariable=self.resize_mode_var,
-                values=("Исходный размер", "Задать вручную"),
-                state="readonly",
-                width=17,
+            self._combo(resize_row, self.resize_mode_var, ("Как в пресете", "Задать вручную"), 15).grid(
+                row=0, column=1, padx=(8, 12)
             )
-            resize_combo.grid(row=0, column=1, padx=(8, 12))
-            resize_combo.bind("<<ComboboxSelected>>", self._on_resize_mode_changed)
-            self.interactive_widgets.append(resize_combo)
-
             self.resize_width_entry = ttk.Entry(
                 resize_row, textvariable=self.resize_width_var, width=7, state="disabled"
             )
             self.resize_width_entry.grid(row=0, column=2)
-            ttk.Label(resize_row, text="×", style="Setting.TLabel").grid(
-                row=0, column=3, padx=6
-            )
+            ttk.Label(resize_row, text="×", style="Setting.TLabel").grid(row=0, column=3, padx=6)
             self.resize_height_entry = ttk.Entry(
                 resize_row, textvariable=self.resize_height_var, width=7, state="disabled"
             )
@@ -1561,148 +2269,34 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 state="disabled",
                 style="Setting.TCheckbutton",
             )
-            self.keep_aspect_check.grid(row=0, column=6, sticky="e")
+            self.keep_aspect_check.grid(row=0, column=6, sticky="w")
             self.interactive_widgets.extend(
                 [self.resize_width_entry, self.resize_height_entry, self.keep_aspect_check]
             )
 
-        def _build_trim_tab(self) -> None:
-            self.trim_tab.columnconfigure(1, weight=1)
+        # ---- состояние ----
 
-            ttk.Label(self.trim_tab, text="Начало:", style="Setting.TLabel").grid(
-                row=0, column=0, sticky="w", pady=(0, 8)
-            )
-            start_scale = ttk.Scale(
-                self.trim_tab,
-                from_=0,
-                to=self.trim_duration,
-                variable=self.trim_start_scale_var,
-                command=self._on_trim_start_scale,
-            )
-            start_scale.grid(row=0, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
-            self.trim_start_scale = start_scale
-            self.interactive_widgets.append(start_scale)
+        def _active_mode(self) -> str:
+            return self.mode_var.get()
 
-            start_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_start_var, width=10)
-            start_entry.grid(row=0, column=2, sticky="e", pady=(0, 8))
-            start_entry.bind("<FocusOut>", self._on_trim_entry_changed)
-            start_entry.bind("<Return>", self._on_trim_entry_changed)
-            self.interactive_widgets.append(start_entry)
-
-            ttk.Label(self.trim_tab, text="Конец:", style="Setting.TLabel").grid(
-                row=1, column=0, sticky="w", pady=(0, 8)
-            )
-            end_scale = ttk.Scale(
-                self.trim_tab,
-                from_=0,
-                to=self.trim_duration,
-                variable=self.trim_end_scale_var,
-                command=self._on_trim_end_scale,
-            )
-            end_scale.grid(row=1, column=1, sticky="ew", padx=(12, 12), pady=(0, 8))
-            self.trim_end_scale = end_scale
-            self.interactive_widgets.append(end_scale)
-
-            end_entry = ttk.Entry(self.trim_tab, textvariable=self.trim_end_var, width=10)
-            end_entry.grid(row=1, column=2, sticky="e", pady=(0, 8))
-            end_entry.bind("<FocusOut>", self._on_trim_entry_changed)
-            end_entry.bind("<Return>", self._on_trim_entry_changed)
-            self.interactive_widgets.append(end_entry)
-
-            ttk.Label(
-                self.trim_tab,
-                textvariable=self.trim_duration_var,
-                style="SettingValue.TLabel",
-            ).grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-            ttk.Label(
-                self.trim_tab,
-                textvariable=self.trim_selection_duration_var,
-                style="SettingValue.TLabel",
-            ).grid(row=2, column=1, columnspan=2, sticky="e", pady=(6, 0))
-
-            ttk.Label(
-                self.trim_tab,
-                text="Двигайте ползунки для быстрой обрезки. Поля справа можно использовать для точного значения в секундах.",
-                style="SettingHint.TLabel",
-                wraplength=760,
-                justify="left",
-            ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        def _build_retro_tab(self) -> None:
-            self.retro_tab.columnconfigure(0, weight=1)
-            ttk.Label(
-                self.retro_tab,
-                text="ШАКАЛЬНАЯ ЗАПИСЬ РАБОЧЕГО СТОЛА",
-                style="SettingTitle.TLabel",
-            ).grid(row=0, column=0, sticky="w")
-            ttk.Label(
-                self.retro_tab,
-                text=(
-                    "Центральный квадрат 480×480 · 12 FPS · звук +20% · "
-                    "watermark www.Bandicam.com"
-                ),
-                style="SettingHint.TLabel",
-                wraplength=720,
-                justify="left",
-            ).grid(row=1, column=0, sticky="w", pady=(8, 0))
-
-        def _build_gif_tab(self) -> None:
-            self.gif_tab.columnconfigure(3, weight=1)
-            fields = (
-                ("Размер:", self.gif_size_var, ("Исходный", "720 px", "480 px", "320 px")),
-                ("FPS:", self.gif_fps_var, ("20", "15", "12", "10", "8")),
-                ("Цвета:", self.gif_colors_var, ("256", "128", "96", "64", "32")),
-                ("Формат:", self.gif_output_format_var, ("GIF", "MP4")),
-            )
-            for index, (label, variable, values) in enumerate(fields):
-                row = index // 2
-                column = (index % 2) * 2
-                ttk.Label(self.gif_tab, text=label, style="Setting.TLabel").grid(
-                    row=row,
-                    column=column,
-                    sticky="w",
-                    padx=(0 if column == 0 else 18, 5),
-                    pady=(0 if row == 0 else 8, 0),
+        def _select_mode(self, mode: str) -> None:
+            self.mode_var.set(mode)
+            for frame in self.mode_frames.values():
+                frame.grid_remove()
+            self.mode_frames[mode].grid(row=0, column=0, sticky="ew")
+            for button_mode, button in self.mode_buttons.items():
+                button.configure(
+                    style="ModeActive.TButton" if button_mode == mode else "Mode.TButton"
                 )
-                combo = ttk.Combobox(
-                    self.gif_tab,
-                    textvariable=variable,
-                    values=values,
-                    state="readonly",
-                    width=10,
-                )
-                combo.grid(
-                    row=row,
-                    column=column + 1,
-                    sticky="w",
-                    pady=(0 if row == 0 else 8, 0),
-                )
-                combo.bind("<<ComboboxSelected>>", self._on_gif_setting_changed)
-                self.interactive_widgets.append(combo)
+            self.run_button.configure(text=self.RUN_LABELS[mode])
+            self._refresh_derived()
 
-            ttk.Label(self.gif_tab, text="Целевой вес:", style="Setting.TLabel").grid(
-                row=2, column=0, sticky="w", pady=(8, 0)
-            )
-            target_entry = ttk.Entry(
-                self.gif_tab, textvariable=self.gif_target_mb_var, width=10
-            )
-            target_entry.grid(row=2, column=1, sticky="w", pady=(8, 0))
-            self.interactive_widgets.append(target_entry)
-            ttk.Label(
-                self.gif_tab,
-                text="МБ (необязательно). Приложение постепенно снизит FPS и число цветов.",
-                style="SettingHint.TLabel",
-            ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
-
-        def _on_gif_setting_changed(self, _event: object | None = None) -> None:
-            if self._active_mode() == "gif":
-                self._update_auto_output_path(force=True)
-
-        def _on_profile_changed(self, _event: object | None = None) -> None:
+        def _on_setting_changed(self, _event: object | None = None) -> None:
             self._refresh_profile_state()
+            self._apply_resize_state()
+            self._refresh_derived()
 
-        def _on_resize_mode_changed(self, _event: object | None = None) -> None:
+        def _apply_resize_state(self) -> None:
             manual = self.resize_mode_var.get() == "Задать вручную"
             state = "normal" if manual and not self.is_busy else "disabled"
             self.resize_width_entry.configure(state=state)
@@ -1710,25 +2304,77 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             self.keep_aspect_check.configure(state=state)
 
         def _refresh_profile_state(self) -> None:
-            selected_title = self.profile_var.get()
-            profile = COMPRESSION_PROFILE_BY_TITLE[selected_title]
+            profile = COMPRESSION_PROFILE_BY_TITLE[self.profile_var.get()]
             self.profile_description_var.set(profile.description)
 
+        def _refresh_derived(self) -> None:
+            self._refresh_plan()
+            self._refresh_output_label()
+
+        def _selected_range(self) -> tuple[float, float | None]:
+            start = self.trim_start_scale_var.get()
+            end = self.trim_end_scale_var.get()
+            duration_known = self.media_info is not None and self.media_info.duration
+            if duration_known and end >= self.trim_duration - 0.05:
+                return start, None
+            return start, end
+
+        def _refresh_plan(self) -> None:
+            if self.selected_input is None or self.media_info is None:
+                self.plan_var.set("Выберите файл — здесь появится расчёт битрейта.")
+                return
+            if not self.media_info.duration:
+                self.plan_var.set("Длительность не определилась — битрейт посчитаем при запуске.")
+                return
+            start, end = self._selected_range()
+            duration = (end if end is not None else self.trim_duration) - start
+            try:
+                limit = parse_size_limit(self.limit_var.get())
+                plan = plan_bitrate(
+                    duration,
+                    limit,
+                    has_audio=self.media_info.has_audio,
+                    info=self.media_info,
+                )
+            except OperationError as exc:
+                self.plan_var.set(f"⚠ {exc}")
+                return
+            self.plan_var.set(f"{format_duration(duration)} → {describe_plan(plan, self.media_info)}")
+
+        def _planned_output(self) -> Path | None:
+            if self.selected_input is None:
+                return None
+            mode = self._active_mode()
+            return resolve_output_path(
+                self.selected_input,
+                self.custom_output,
+                export_output_tag(mode, self.selected_input),
+                output_suffix=export_output_suffix(mode),
+            )
+
+        def _refresh_output_label(self) -> None:
+            output = self._planned_output()
+            if output is None:
+                self.output_var.set("Результат сохранится рядом с исходным файлом.")
+                self.reset_output_button.grid_remove()
+                return
+            if self.custom_output is None:
+                self.output_var.set(f"Сохранится как  {output.name}  (рядом с исходником)")
+                self.reset_output_button.grid_remove()
+            else:
+                self.output_var.set(f"Сохранится как  {output}")
+                self.reset_output_button.grid()
+
+        # ---- фрагмент ----
+
         def _set_trim_duration(self, duration: float | None) -> None:
-            self.trim_duration = max(duration or DEFAULT_TRIM_DURATION, 1.0)
+            self.trim_duration = max(duration or DEFAULT_TRIM_DURATION, 0.2)
             self.trim_start_scale.configure(to=self.trim_duration)
             self.trim_end_scale.configure(to=self.trim_duration)
+            self._set_trim_values(0.0, self.trim_duration)
 
-            start = min(self.trim_start_scale_var.get(), self.trim_duration)
-            end = min(max(self.trim_end_scale_var.get(), start + 1), self.trim_duration)
-            if end <= start:
-                start = 0
-                end = min(10.0, self.trim_duration)
-
-            self.trim_duration_var.set(
-                f"Диапазон ползунков: 0-{format_seconds(self.trim_duration)} сек"
-            )
-            self._set_trim_values(start, end)
+        def select_full_range(self) -> None:
+            self._set_trim_values(0.0, self.trim_duration)
 
         def _set_trim_values(self, start: float, end: float) -> None:
             start = max(0.0, min(start, self.trim_duration))
@@ -1741,12 +2387,18 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             self._syncing_trim_controls = True
             self.trim_start_scale_var.set(start)
             self.trim_end_scale_var.set(end)
-            self.trim_start_var.set(format_seconds(start))
-            self.trim_end_var.set(format_seconds(end))
-            self.trim_selection_duration_var.set(
-                f"ДЛИТЕЛЬНОСТЬ: {format_seconds(max(0.0, end - start))} сек"
-            )
+            self.trim_start_var.set(format_seconds(round(start, 2)))
+            self.trim_end_var.set(format_seconds(round(end, 2)))
             self._syncing_trim_controls = False
+
+            length = end - start
+            if start <= 0 and end >= self.trim_duration - 0.05:
+                self.trim_selection_var.set(f"Всё видео · {format_duration(length)}")
+            else:
+                self.trim_selection_var.set(
+                    f"Фрагмент: {format_duration(length)} из {format_duration(self.trim_duration)}"
+                )
+            self._refresh_plan()
 
         def _on_trim_start_scale(self, raw_value: str) -> None:
             if self._syncing_trim_controls:
@@ -1776,44 +2428,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 return
             self._set_trim_values(start, end)
 
-        def _on_tab_changed(self, _event: object | None = None) -> None:
-            self._update_run_button_text()
-            self._update_auto_output_path()
-
-        def _select_operation_mode(self, mode: str, *, refresh_output: bool = True) -> None:
-            self.operation_mode_var.set(mode)
-            mode_frames = {
-                "compress": self.compress_tab,
-                "trim": self.trim_tab,
-                "retro": self.retro_tab,
-                "gif": self.gif_tab,
-            }
-            for frame in mode_frames.values():
-                frame.grid_remove()
-            mode_frames[mode].grid(row=0, column=0, sticky="ew")
-
-            for button_mode, button in self.mode_buttons.items():
-                button.configure(
-                    style="ModeActive.TButton" if button_mode == mode else "Mode.TButton"
-                )
-
-            self._update_run_button_text()
-            if refresh_output:
-                self._update_auto_output_path()
-
-        def _update_run_button_text(self) -> None:
-            mode = self._active_mode()
-            if mode == "compress":
-                self.run_button.configure(text="СЖАТЬ ВИДЕО")
-            elif mode == "trim":
-                self.run_button.configure(text="ОБРЕЗАТЬ ВИДЕО")
-            elif mode == "gif":
-                self.run_button.configure(text="ОПТИМИЗИРОВАТЬ GIF")
-            else:
-                self.run_button.configure(text="СДЕЛАТЬ КВАДРАТ ИЗ 2000-Х")
-
-        def _active_mode(self) -> str:
-            return self.operation_mode_var.get()
+        # ---- файлы ----
 
         def _video_dialog_types(self) -> list[tuple[str, str]]:
             mask = " ".join(f"*{extension}" for extension in sorted(VIDEO_EXTENSIONS))
@@ -1822,95 +2437,58 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
         def choose_input_file(self) -> None:
             file_path = filedialog.askopenfilename(
                 parent=self.root,
-                title="Выберите видеофайл",
+                title="Выберите видео или GIF",
                 filetypes=self._video_dialog_types(),
             )
-            if not file_path:
-                return
+            if file_path:
+                self.load_input_file(Path(file_path))
 
-            self.selected_input = ensure_input_exists(Path(file_path))
-            duration = probe_video_duration(self.selected_input)
+        def load_input_file(self, path: Path) -> None:
+            self.selected_input = ensure_input_exists(path)
+            self.media_info = probe_media(self.selected_input)
+            info = self.media_info
             self.input_path_var.set(str(self.selected_input))
-            duration_text = (
-                f" | длительность: {format_seconds(duration)} сек"
-                if duration is not None
-                else ""
-            )
-            self.input_info_var.set(
-                f"{self.selected_input.name} | {format_size(self.selected_input.stat().st_size)}{duration_text}"
-            )
-            self._set_trim_duration(duration)
-            if self.selected_input.suffix.lower() == ".gif":
-                self._select_operation_mode("gif", refresh_output=False)
+
+            parts = [format_size(self.selected_input.stat().st_size)]
+            if info.duration:
+                parts.append(format_duration(info.duration))
+            if info.width and info.height:
+                parts.append(f"{info.width}×{info.height}")
+            if info.fps:
+                parts.append(f"{format_seconds(round(info.fps, 2))} FPS")
+            parts.append("со звуком" if info.has_audio else "без звука")
+            self.input_info_var.set(" · ".join(parts))
+
+            self.custom_output = None
             self.last_output_path = None
             self.open_folder_button.configure(state="disabled")
-            self._update_auto_output_path(force=True)
-            self.status_var.set("Файл выбран. Можно запускать обработку.")
+            self.progress.configure(value=0)
+            self._set_trim_duration(info.duration)
+            if self.selected_input.suffix.lower() == ".gif":
+                self._select_mode("gif")
+            else:
+                self._refresh_derived()
+            self.status_var.set("Файл выбран. Выделите фрагмент и жмите кнопку.")
 
-        def _update_auto_output_path(self, force: bool = False) -> None:
-            if self.selected_input is None:
-                return
-
-            suffix = {
-                "compress": "compressed",
-                "trim": "trimmed",
-                "retro": "square_2000s",
-                "gif": "optimized",
-            }[self._active_mode()]
-            output_suffix = (
-                ".mp4"
-                if self._active_mode() == "gif" and self.gif_output_format_var.get() == "MP4"
-                else None
-            )
-            suggested = str(
-                resolve_output_path(
-                    self.selected_input, None, suffix, output_suffix=output_suffix
-                )
-            )
-            current = self.output_path_var.get().strip()
-
-            if force or not current or current == self.auto_output_path:
-                self.output_path_var.set(suggested)
-
-            self.auto_output_path = suggested
-
-        def use_auto_output_path(self) -> None:
-            self._update_auto_output_path(force=True)
+        def reset_output_path(self) -> None:
+            self.custom_output = None
+            self._refresh_output_label()
 
         def choose_output_file(self) -> None:
-            initial_file = ""
-            initial_dir = str(Path.cwd())
-
-            if self.selected_input is not None:
-                self._update_auto_output_path()
-                initial_file = Path(self.output_path_var.get() or self.auto_output_path or "").name
-                initial_dir = str(self.selected_input.parent)
-
-            gif_as_mp4 = (
-                self._active_mode() == "gif" and self.gif_output_format_var.get() == "MP4"
-            )
+            planned = self._planned_output()
+            suffix = export_output_suffix(self._active_mode())
+            kind = "GIF" if suffix == ".gif" else "MP4"
             output_path = filedialog.asksaveasfilename(
                 parent=self.root,
                 title="Куда сохранить результат",
-                filetypes=(
-                    [("GIF", "*.gif"), ("Все файлы", "*.*")]
-                    if self.selected_input is not None
-                    and self.selected_input.suffix.lower() == ".gif"
-                    and not gif_as_mp4
-                    else [("MP4", "*.mp4"), ("Все файлы", "*.*")]
-                ),
-                defaultextension=(
-                    ".gif"
-                    if self.selected_input is not None
-                    and self.selected_input.suffix.lower() == ".gif"
-                    and not gif_as_mp4
-                    else ".mp4"
-                ),
-                initialdir=initial_dir,
-                initialfile=initial_file,
+                filetypes=[(kind, f"*{suffix}"), ("Все файлы", "*.*")],
+                defaultextension=suffix,
+                initialdir=str(planned.parent if planned else Path.cwd()),
+                initialfile=planned.name if planned else "",
             )
             if output_path:
-                self.output_path_var.set(output_path)
+                self.custom_output = Path(output_path)
+                self._refresh_output_label()
 
         def _parse_non_negative_float(self, raw_value: str, field_name: str) -> float:
             value_text = raw_value.strip().replace(",", ".")
@@ -1936,159 +2514,107 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
                 raise ValueError(f"Поле '{field_name}' должно быть больше нуля.") from None
             return value
 
-        def _resolve_output_for_ui(self) -> Path | None:
-            raw_value = self.output_path_var.get().strip().strip('"')
-            if not raw_value:
-                return None
+        def _build_job(self) -> ExportJob:
             if self.selected_input is None:
-                return normalize_output_path(Path(raw_value))
-            return resolve_output_path(self.selected_input, Path(raw_value), "result")
-
-        def _build_compress_args(self) -> argparse.Namespace:
-            if self.selected_input is None:
-                raise ValueError("Сначала выберите видеофайл.")
-            if (
-                self._active_mode() == "compress"
-                and self.selected_input.suffix.lower() == ".gif"
-            ):
-                self._select_operation_mode("gif")
-                raise ValueError("GIF обрабатываются в отдельном режиме «Оптимизировать GIF».")
-
-            if self._active_mode() == "retro":
-                profile = next(profile for profile in COMPRESSION_PROFILES if profile.retro_square)
-            else:
-                profile = COMPRESSION_PROFILE_BY_TITLE[self.profile_var.get()]
-
-            width = profile.width
-            height = None
-            keep_aspect = True
-            if self._active_mode() == "compress" and self.resize_mode_var.get() == "Задать вручную":
-                width = self._parse_optional_dimension(self.resize_width_var.get(), "Ширина")
-                height = self._parse_optional_dimension(self.resize_height_var.get(), "Высота")
-                if width is None and height is None:
-                    raise ValueError("Укажите ширину или высоту итогового файла.")
-                keep_aspect = self.keep_aspect_var.get()
-                if not keep_aspect and (width is None or height is None):
-                    raise ValueError(
-                        "Для растягивания без сохранения пропорций укажите и ширину, и высоту."
-                    )
-            return argparse.Namespace(
-                input=self.selected_input,
-                output=self._resolve_output_for_ui(),
-                crf=profile.crf,
-                preset=profile.preset,
-                width=width,
-                height=height,
-                keep_aspect=keep_aspect,
-                audio_bitrate=profile.audio_bitrate,
-                no_audio=profile.no_audio,
-                retro_square=profile.retro_square,
-            )
-
-        def _build_trim_args(self) -> argparse.Namespace:
-            if self.selected_input is None:
-                raise ValueError("Сначала выберите видеофайл.")
-
+                raise ValueError("Сначала выберите файл.")
             self._on_trim_entry_changed()
-            start = self._parse_non_negative_float(self.trim_start_var.get(), "Начало")
-            end = self._parse_non_negative_float(self.trim_end_var.get(), "Конец")
-
-            return argparse.Namespace(
-                input=self.selected_input,
-                output=self._resolve_output_for_ui(),
+            start, end = self._selected_range()
+            mode = self._active_mode()
+            job = ExportJob(
+                input_path=self.selected_input,
+                mode=mode,
+                output_path=self.custom_output,
                 start=start,
                 end=end,
+                size_limit_mb=parse_size_limit(self.limit_var.get()),
             )
 
-        def _build_gif_args(self) -> argparse.Namespace:
-            if self.selected_input is None:
-                raise ValueError("Сначала выберите GIF-файл.")
-            if self.selected_input.suffix.lower() != ".gif":
-                raise ValueError("Для этого режима выберите файл в формате GIF.")
+            if mode == "gif":
+                width_text = self.gif_width_var.get()
+                job.gif_width = None if width_text == "Исходная" else int(width_text.split()[0])
+                job.gif_aspect = self.gif_aspect_var.get()
+                job.gif_fps = int(self.gif_fps_var.get())
+                job.gif_colors = int(self.gif_colors_var.get())
+                target_text = self.gif_target_mb_var.get().strip().replace(",", ".")
+                if target_text:
+                    try:
+                        job.gif_target_mb = float(target_text)
+                    except ValueError as exc:
+                        raise ValueError("Макс. вес GIF должен быть числом в мегабайтах.") from exc
+                    if job.gif_target_mb <= 0:
+                        raise ValueError("Макс. вес GIF должен быть больше нуля.")
+            elif mode == "custom":
+                job.profile_title = self.profile_var.get()
+                if self.resize_mode_var.get() == "Задать вручную":
+                    job.width = self._parse_optional_dimension(self.resize_width_var.get(), "Ширина")
+                    job.height = self._parse_optional_dimension(self.resize_height_var.get(), "Высота")
+                    if job.width is None and job.height is None:
+                        raise ValueError("Укажите ширину или высоту итогового файла.")
+                    job.keep_aspect = self.keep_aspect_var.get()
+                    if not job.keep_aspect and (job.width is None or job.height is None):
+                        raise ValueError(
+                            "Для растягивания без сохранения пропорций укажите и ширину, и высоту."
+                        )
+            return job
 
-            size_text = self.gif_size_var.get()
-            width = None if size_text == "Исходный" else int(size_text.split()[0])
-            target_text = self.gif_target_mb_var.get().strip().replace(",", ".")
-            target_size_mb = None
-            if target_text:
-                try:
-                    target_size_mb = float(target_text)
-                except ValueError as exc:
-                    raise ValueError("Целевой вес должен быть числом в мегабайтах.") from exc
-                if target_size_mb <= 0:
-                    raise ValueError("Целевой вес должен быть больше нуля.")
-
-            return argparse.Namespace(
-                input=self.selected_input,
-                output=self._resolve_output_for_ui(),
-                crf=24,
-                preset="medium",
-                width=width,
-                height=None,
-                keep_aspect=True,
-                audio_bitrate="96k",
-                no_audio=False,
-                retro_square=False,
-                gif_fps=int(self.gif_fps_var.get()),
-                gif_colors=int(self.gif_colors_var.get()),
-                gif_output_format=self.gif_output_format_var.get(),
-                target_size_mb=target_size_mb,
-            )
+        # ---- запуск ----
 
         def start_operation(self) -> None:
             if self.worker_thread and self.worker_thread.is_alive():
                 return
-
             try:
-                if self._active_mode() == "gif":
-                    args = self._build_gif_args()
-                    handler = process_optimize_gif
-                    start_message = "Запущена оптимизация GIF..."
-                elif self._active_mode() in {"compress", "retro"}:
-                    args = self._build_compress_args()
-                    handler = process_compress
-                    start_message = (
-                        "Запущен квадратный режим из 2000-х..."
-                        if self._active_mode() == "retro"
-                        else "Запущено сжатие..."
-                    )
-                else:
-                    args = self._build_trim_args()
-                    handler = process_trim
-                    start_message = "Запущена обрезка..."
+                job = self._build_job()
             except ValueError as exc:
                 messagebox.showerror("Ошибка", str(exc), parent=self.root)
                 self.status_var.set(str(exc))
                 return
 
+            start_message = {
+                "discord": "Сжимаю под Discord…",
+                "retro": "Шакалю в стиле 2000-х…",
+                "gif": "Делаю GIF…",
+                "custom": "Сжимаю…",
+            }[job.mode]
             self.clear_log()
             self.append_log(start_message)
-            if args.output is not None:
-                self.append_log(f"Файл результата: {args.output}")
+            planned = self._planned_output()
+            if planned is not None:
+                self.append_log(f"Файл результата: {planned}")
+            self.progress.configure(value=0)
             self._set_busy(True, start_message)
 
             self.worker_thread = threading.Thread(
-                target=self._run_worker,
-                args=(handler, args),
-                daemon=True,
+                target=self._run_worker, args=(job,), daemon=True
             )
             self.worker_thread.start()
 
-        def _run_worker(self, handler: object, args: argparse.Namespace) -> None:
+        def _report_progress(self, fraction: float) -> None:
+            self.root.after(0, self._show_progress, fraction)
+
+        def _show_progress(self, fraction: float) -> None:
+            if not self.is_busy:
+                return
+            percent = int(fraction * 100)
+            self.progress.configure(value=percent)
+            self.status_var.set(f"Обработка… {percent}%")
+
+        def _run_worker(self, job: ExportJob) -> None:
             try:
-                result = handler(args, quiet=True)
+                result = process_export(job, on_progress=self._report_progress)
             except OperationError as exc:
-                self.root.after(0, lambda: self._finish_with_error(exc))
+                self.root.after(0, self._finish_with_error, exc)
                 return
             except Exception as exc:
-                wrapped_error = OperationError(f"Неожиданная ошибка: {exc}")
-                self.root.after(0, lambda: self._finish_with_error(wrapped_error))
+                self.root.after(
+                    0, self._finish_with_error, OperationError(f"Неожиданная ошибка: {exc}")
+                )
                 return
-
-            self.root.after(0, lambda: self._finish_with_success(result))
+            self.root.after(0, self._finish_with_success, result)
 
         def _finish_with_success(self, result: OperationResult) -> None:
-            self._set_busy(False, f"{result.action_name} завершено.")
+            size = format_size(result.output_path.stat().st_size)
+            self._set_busy(False, f"Готово: {result.output_path.name} — {size}")
+            self.progress.configure(value=100)
             self.last_output_path = result.output_path
             self.open_folder_button.configure(state="normal")
             self.append_log("")
@@ -2097,6 +2623,7 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
 
         def _finish_with_error(self, error: OperationError) -> None:
             self._set_busy(False, "Операция завершилась с ошибкой.")
+            self.progress.configure(value=0)
             self.append_log("")
             self.append_log(str(error))
             messagebox.showerror("Ошибка", str(error), parent=self.root)
@@ -2104,22 +2631,15 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
         def _set_busy(self, busy: bool, status_text: str) -> None:
             self.is_busy = busy
             self.status_var.set(status_text)
-            if busy:
-                self.progress.start(12)
-            else:
-                self.progress.stop()
-
             for widget in self.interactive_widgets:
                 if isinstance(widget, ttk.Combobox):
                     widget.configure(state="disabled" if busy else "readonly")
                 else:
                     widget.configure(state="disabled" if busy else "normal")
             if not busy:
-                self._on_resize_mode_changed()
+                self._apply_resize_state()
 
-            if busy:
-                self.open_folder_button.configure(state="disabled")
-            elif self.last_output_path is not None and self.last_output_path.exists():
+            if not busy and self.last_output_path is not None and self.last_output_path.exists():
                 self.open_folder_button.configure(state="normal")
             else:
                 self.open_folder_button.configure(state="disabled")
@@ -2139,16 +2659,15 @@ if tk is not None and ttk is not None and filedialog is not None and messagebox 
             if self.last_output_path is None:
                 return
 
-            output_dir = self.last_output_path.parent
             if os.name == "nt":
-                os.startfile(output_dir)
+                subprocess.Popen(["explorer", "/select,", str(self.last_output_path)])
                 return
 
             if sys.platform == "darwin":
-                subprocess.Popen(["open", str(output_dir)])
+                subprocess.Popen(["open", "-R", str(self.last_output_path)])
                 return
 
-            subprocess.Popen(["xdg-open", str(output_dir)])
+            subprocess.Popen(["xdg-open", str(self.last_output_path.parent)])
 
 
 def launch_gui() -> int:
@@ -2182,7 +2701,7 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         return launch_gui()
 
-    known_commands = {"gui", "menu", "compress", "trim", "-h", "--help"}
+    known_commands = {"gui", "menu", "compress", "trim", "export", "-h", "--help"}
     if argv[0] not in known_commands:
         argv = ["compress", *argv]
 
@@ -2197,6 +2716,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_compress(args)
     if args.command == "trim":
         return run_trim(args)
+    if args.command == "export":
+        return run_export(args)
 
     parser.print_help()
     return 1

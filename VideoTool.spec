@@ -13,6 +13,8 @@ datas += [
     (str(project_dir / "mode-compress.png"), "."),
     (str(project_dir / "mode-trim.png"), "."),
     (str(project_dir / "mode-retro.png"), "."),
+    (str(project_dir / "mode-gif.png"), "."),
+    (str(project_dir / "mode-custom.png"), "."),
     (str(project_dir / "DotA2MinimapIcons_AgADagwAAsd2IVA.png"), "."),
     (str(project_dir / "cusini_royal_video_tool.ico"), "."),
 ]
